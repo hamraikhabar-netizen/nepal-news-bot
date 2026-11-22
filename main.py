@@ -21,7 +21,7 @@ except Exception:
 ALLOW_ARTICLE_PHOTOS = False
 GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Charon")  # वाचक आवाज
 SPEED = 1.15          # वाचन गति (1.0 = सामान्य, 1.15 = अलि छिटो)
-MUSIC_VOLUME = 0.30   # पृष्ठभूमि सङ्गीतको आवाज (0.05 - 0.2)
+MUSIC_TARGET_DB = -30  # पृष्ठभूमि सङ्गीतको औसत आवाज (dB); -26 = चर्को, -34 = हल्का
 # ================================================================================
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "morning"
@@ -84,6 +84,9 @@ def entry_image(e):
     return m.group(1) if m else ""
 
 
+ASSETS = (None, [], {})   # (transition, music list, info) - main() मा भरिन्छ
+
+
 def fetch_news():
     items, seen = [], set()
     for url in FEEDS:
@@ -95,8 +98,9 @@ def fetch_news():
                 if not title or title in seen:
                     continue
                 seen.add(title)
+                pub = clean((e.get("source") or {}).get("title", "")) or src
                 items.append({"title": title, "summary": clean(e.get("summary", ""))[:300],
-                              "source": src, "link": e.get("link", ""), "image": entry_image(e)})
+                              "source": pub, "link": e.get("link", ""), "image": entry_image(e)})
             print(f"feed ok: {src} ({len(d.entries)})")
         except Exception as ex:
             print("feed failed:", url, ex)
@@ -169,8 +173,18 @@ RULES = (
     "headline अत्यन्त छोटो (४०-४५ अक्षरभित्र), पूरा अर्थ दिने, एक पङ्क्तिमा अटाउने र टुङ्गिएको हुनुपर्छ "
     "(जस्तै 'प्रधानमन्त्री भारत भ्रमणमा')। "
     "'ref' मा सूचीको नम्बर (integer) राख। "
-    "'image_query' मा त्यो समाचारको मुख्य व्यक्ति/स्थान/संस्थाको नाम अंग्रेजीमा २-४ शब्दमा लेख "
-    "(जस्तै 'Balen Shah', 'Kathmandu'); सूचीमा नभएको नाम नबनाऊ। "
+    "'type' मा: 'person_event' (नाम चलेका व्यक्ति/नेता/सरकारी कार्यक्रम/भ्रमण), 'accident' (दुर्घटना, आगलागी, "
+    "बाढीपहिरो, हत्या/अपराध, मृत्यु), 'sensitive' (बलात्कार/यौन हिंसा, बाल दुर्व्यवहार, आत्महत्या), "
+    "वा 'general' मध्ये एउटा राख। "
+    "'sensitive' प्रकारमा: पीडितको नाम, ठेगाना, स्कुल, परिवार वा चिनिने कुनै विवरण नलेख; घटनाको विवरण/तरिका नलेख; "
+    "आरोपितलाई दोषी नभन ('आरोप', 'प्रहरीका अनुसार' भन); सूचीमा भएको अदालत/प्रहरीको कारबाही मात्र भन; "
+    "आत्महत्याको तरिका कहिल्यै नलेख। video_query मा प्रतीकात्मक दृश्य मात्र राख "
+    "(जस्तै 'justice scale', 'gavel court', 'police station', 'helping hands', 'stop violence', 'candle')। "
+    "'image_queries' मा अंग्रेजीमा २-३ खोज वाक्यांशको सूची: पहिलो सबैभन्दा विशिष्ट (जस्तै 'Balen Shah India visit'), "
+    "दोस्रो मुख्य व्यक्ति/स्थान मात्र (जस्तै 'Balen Shah'); सूचीमा नभएको नाम नबनाऊ। "
+    "'accident' प्रकारमा: पीडितको नाम/अनुहार वा डरलाग्दो विवरण नलेख; घटनाको तथ्य मात्र सरल र संवेदनशील भाषामा लेख; "
+    "video_query मा सुरक्षित सामान्य दृश्य मात्र राख (जस्तै 'ambulance', 'highway traffic', 'police car', "
+    "'fire truck', 'hospital corridor', 'rain flood street')। "
     "'video_query' मा त्यो समाचारसँग मिल्ने सामान्य दृश्यको अंग्रेजी खोजशब्द २-३ शब्दमा लेख "
     "(जस्तै 'parliament building', 'flood water', 'airport', 'cricket stadium', 'protest crowd')। "
 )
@@ -179,7 +193,8 @@ SCHEMA = (
     'JSON मात्र फर्काऊ: {"title": "YouTube शीर्षक (नेपालीमा, ९० अक्षरभित्र)", '
     '"description": "२-३ वाक्यको विवरण", '
     '"items": [{"headline": "छोटो शीर्षक", "narration": "वाचन पाठ", "ref": 1, '
-    '"image_query": "Balen Shah", "video_query": "parliament building"}]}. '
+    '"type": "person_event", "image_queries": ["Balen Shah India visit", "Balen Shah"], '
+    '"video_query": "airport red carpet"}]}. '
 )
 
 
@@ -349,6 +364,26 @@ def pixabay_video(q, idx):
     return None
 
 
+def pixabay_image(q, idx):
+    """Pixabay को निःशुल्क फोटो/चित्र (उही API key)। संवेदनशील समाचारमा प्रतीकात्मक दृश्यको लागि।"""
+    key = os.environ.get("PIXABAY_API_KEY")
+    if not key or not q:
+        return None
+    try:
+        r = requests.get("https://pixabay.com/api/", timeout=40, params={
+            "key": key, "q": q[:100], "image_type": "all", "orientation": "horizontal",
+            "min_width": 1280, "safesearch": "true", "per_page": 10})
+        r.raise_for_status()
+        for v in r.json().get("hits", []):
+            url = v.get("largeImageURL")
+            path = f"{OUT}/photo_{idx}.jpg"
+            if url and download(url, path):
+                return path, f'फोटो: {v.get("user", "")} / Pixabay ({v.get("pageURL", "")})'
+    except Exception as ex:
+        print("pixabay image fail:", str(ex)[:150])
+    return None
+
+
 def commons_video(q, idx):
     """Wikimedia Commons बाट खुला लाइसेन्सको भिडियो (कुञ्जी चाहिँदैन)।"""
     if not q:
@@ -377,13 +412,15 @@ def commons_video(q, idx):
     return None
 
 
-def commons_search(q):
-    """Wikimedia Commons बाट खुला लाइसेन्सको फोटो खोज्ने।"""
+def commons_search(q, newest=False):
+    """Wikimedia Commons बाट खुला लाइसेन्सको फोटो खोज्ने। newest=True भए नयाँ अपलोड पहिले।"""
+    params = {"action": "query", "generator": "search", "gsrsearch": q, "gsrnamespace": 6,
+              "gsrlimit": 15, "prop": "imageinfo", "iiprop": "url|extmetadata|size|mime",
+              "iiurlwidth": 1600, "format": "json"}
+    if newest:
+        params["gsrsort"] = "create_timestamp_desc"
     try:
-        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=40, params={
-            "action": "query", "generator": "search", "gsrsearch": q, "gsrnamespace": 6,
-            "gsrlimit": 12, "prop": "imageinfo", "iiprop": "url|extmetadata|size|mime",
-            "iiurlwidth": 1600, "format": "json"})
+        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=40, params=params)
         pages = r.json().get("query", {}).get("pages", {})
     except Exception as ex:
         print("commons fail:", str(ex)[:120])
@@ -404,29 +441,77 @@ def commons_search(q):
     return None
 
 
-def get_media(idx, item, news):
-    """प्राथमिकता: भिडियो -> फोटो -> (नभए खाली background)। (kind, path, credit) फर्काउँछ।"""
-    vq = item.get("video_query", "")
-    iq = item.get("image_query", "")
-    r = pixabay_video(vq, idx) or pexels_video(vq, idx) or commons_video(iq, idx) or commons_video(vq, idx)
-    if r:
-        return "video", r[0], r[1]
+def commons_photo(queries, idx):
     path = f"{OUT}/photo_{idx}.jpg"
-    cands = []
+    for q in queries:
+        for newest in (True, False):            # पहिले सबैभन्दा नयाँ, नभए सबैभन्दा मिल्ने
+            c = commons_search(q, newest)
+            if c and download(c[0], path):
+                return path, c[1]
+    return None
+
+
+def commons_video_any(queries, idx):
+    for q in queries:
+        r = commons_video(q, idx)
+        if r:
+            return r
+    return None
+
+
+def get_media(idx, item, news):
+    """समाचारको प्रकार अनुसार दृश्य छान्ने। (kind, path, credit) फर्काउँछ।
+    person_event: Commons भिडियो -> Commons फोटो -> Pixabay/Pexels भिडियो
+    general     : Pixabay/Pexels भिडियो -> Commons भिडियो -> Commons फोटो
+    accident    : सुरक्षित सामान्य भिडियो (Pixabay/Pexels), नभए Pixabay फोटो; वास्तविक घटनाको फोटो/भिडियो प्रयोग गर्दैन
+    sensitive   : प्रतीकात्मक Pixabay चित्र (न्यायको तराजु, हथौडा आदि) मात्र; पीडित/घटनाको कुनै दृश्य होइन
+    """
+    typ = item.get("type", "general")
+    vq = item.get("video_query", "")
+    iqs = [q for q in (item.get("image_queries") or []) if q]
+    if not iqs and item.get("image_query"):
+        iqs = [item["image_query"]]
+
+    def stock():
+        return pixabay_video(vq, idx) or pexels_video(vq, idx)
+
+    r = None
+    if typ == "sensitive":      # बलात्कार/यौन हिंसा/बाल दुर्व्यवहार/आत्महत्या: प्रतीकात्मक सुरक्षित चित्र मात्र
+        p = pixabay_image(vq, idx)
+        if p:
+            return "photo", p[0], p[1]
+        r = stock()
+        return ("video", r[0], r[1]) if r else (None, None, "")
+    if typ == "accident":
+        r = stock()
+        if r:
+            return "video", r[0], r[1]
+        p = pixabay_image(vq, idx)
+        return ("photo", p[0], p[1]) if p else (None, None, "")
+    if typ == "person_event":
+        r = commons_video_any(iqs, idx)
+        if r:
+            return "video", r[0], r[1]
+        p = commons_photo(iqs, idx)
+        if p:
+            return "photo", p[0], p[1]
+        r = stock()
+        if r:
+            return "video", r[0], r[1]
+    else:
+        r = stock() or commons_video_any([vq] + iqs, idx)
+        if r:
+            return "video", r[0], r[1]
+        p = commons_photo(iqs, idx)
+        if p:
+            return "photo", p[0], p[1]
     if ALLOW_ARTICLE_PHOTOS:
         try:
             n = news[int(item["ref"]) - 1]
-            if n.get("image"):
-                cands.append((n["image"], ""))
+            if n.get("image") and download(n["image"], f"{OUT}/photo_{idx}.jpg"):
+                return "photo", f"{OUT}/photo_{idx}.jpg", ""
         except Exception:
             pass
-    if iq:
-        c = commons_search(iq)
-        if c:
-            cands.append(c)
-    for url, credit in cands:
-        if download(url, path):
-            return "photo", path, credit
     return None, None, ""
 
 
@@ -460,27 +545,114 @@ def wrap(draw, text, fnt, maxw):
     return lines
 
 
+def find_logo():
+    """repo मा रहेको logo खोज्ने: logo.png -> नाममा logo/khabar/hamr भएको png -> कुनै पनि png।"""
+    pngs = [f for f in os.listdir(".") if f.lower().endswith(".png")]
+    for pat in ("logo.png",):
+        if pat in pngs:
+            return pat
+    for key in ("logo", "khabar", "hamr", "hk"):
+        for f in sorted(pngs):
+            if key in f.lower():
+                return f
+    return sorted(pngs)[0] if pngs else None
+
+
+LOGO_PATH = find_logo()
+print("logo:", LOGO_PATH)
+
+
+def load_logo(size):
+    """logo लाई अनुपात नबिगारी size x size भित्र अटाउने गरी तयार पार्ने।"""
+    im = Image.open(LOGO_PATH).convert("RGBA")
+    im.thumbnail((size * 2, size), Image.LANCZOS)
+    return im
+
+
 def fallback_bg(path):
     img = Image.new("RGB", (W, H), (11, 31, 92))
-    logo = Image.open("logo.png").convert("RGBA").resize((520, 520))
-    img.paste(logo, ((W - 520) // 2, (H - 520) // 2 - 60), logo)
+    logo = load_logo(520)
+    img.paste(logo, ((W - logo.width) // 2, (H - logo.height) // 2 - 60), logo)
     img.save(path)
     return path
 
 
-def frame_png(path):
-    """पारदर्शी तह; माथि बायाँ कुनामा सानो logo मात्र (च्यानलको नाम छैन)।"""
+SRC_LABELS = {
+    "online khabar": "अनलाइनखबर", "onlinekhabar": "अनलाइनखबर", "अनलाइनखबर": "अनलाइनखबर",
+    "setopati": "सेतोपाटी", "ratopati": "रातोपाटी", "bbc": "बीबीसी नेपाली",
+    "ekantipur": "कान्तिपुर", "kantipur": "कान्तिपुर", "kathmandu post": "The Kathmandu Post",
+    "himalayan": "The Himalayan Times", "annapurna": "अन्नपूर्ण पोस्ट",
+    "rastriya samachar": "राससस", "rss": "राससस", "nepal samacharpatra": "नेपाल समाचारपत्र",
+}
+
+
+def source_label(src):
+    low = (src or "").lower()
+    for k, v in SRC_LABELS.items():
+        if k in low:
+            return v
+    return re.sub(r"\s*[-–|]\s*Google News.*$", "", src or "").strip('" ') or "Google News"
+
+
+def credit_site(credit):
+    for k in ("Pixabay", "Pexels", "Wikimedia Commons"):
+        if k in (credit or ""):
+            return k
+    return ""
+
+
+def latin_font(size):
+    p = os.environ.get("LATIN_FONT_PATH")
+    if not p:
+        for pat in ("/usr/share/fonts/**/NotoSans-Regular.ttf", "/usr/share/fonts/**/DejaVuSans.ttf"):
+            g = glob.glob(pat, recursive=True)
+            if g:
+                p = g[0]
+                break
+    return ImageFont.truetype(p, size) if p else ImageFont.load_default()
+
+
+def draw_mixed(d, right, y, text, size, fill):
+    """नेपाली र अंग्रेजी अक्षर मिसिएको सानो पाठ दायाँ छेउबाट मिलाएर लेख्ने।"""
+    runs = re.findall(r"[A-Za-z0-9 .,&'\-/:@]+|[^A-Za-z0-9 .,&'\-/:@]+", text)
+    parts, total = [], 0
+    for r in runs:
+        f = latin_font(size) if re.match(r"[A-Za-z0-9 .,&'\-/:@]", r[0]) else font(size)
+        w = d.textlength(r, font=f)
+        parts.append((r, f, w))
+        total += w
+    x = right - total
+    for r, f, w in parts:
+        d.text((x, y), r, font=f, fill=fill)
+        x += w
+    return total
+
+
+def frame_png(path, label=None):
+    """पारदर्शी तह; माथि बायाँ logo, र (भए) माथि दायाँ सानो स्रोत/क्रेडिट पाठ।"""
     fr = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    logo = Image.open("logo.png").convert("RGBA").resize((130, 130))
-    shadow = Image.new("RGBA", (150, 150), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).ellipse((6, 10, 146, 146), fill=(0, 0, 0, 110))
-    fr.alpha_composite(shadow, (30, 28))
+    logo = load_logo(130)
+    sh = Image.new("RGBA", (logo.width + 40, logo.height + 40), (0, 0, 0, 0))
+    sh.paste((0, 0, 0, 120), (20, 26), logo.getchannel("A"))
+    sh = sh.filter(ImageFilter.GaussianBlur(7))
+    fr.alpha_composite(sh, (20, 16))
     fr.alpha_composite(logo, (40, 36))
+    if label:
+        tmp = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        size = 30
+        tw = draw_mixed(tmp, 0, 0, label, size, (0, 0, 0))   # चौडाइ नाप्न मात्र
+        pill = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        pd = ImageDraw.Draw(pill)
+        pd.rounded_rectangle((W - 40 - tw - 36, 34, W - 40, 34 + size + 28), radius=14, fill=(0, 0, 0, 120))
+        fr = Image.alpha_composite(fr, pill)
+        draw_mixed(ImageDraw.Draw(fr), W - 40 - 18, 34 + 10, label, size, (255, 255, 255, 235))
     fr.save(path)
     return path
 
 
 BW, CW = 1400, 240
+BAR_C0, BAR_C1 = (215, 0, 10), (170, 0, 15)      # शीर्षक पट्टीको रङ (बायाँ -> दायाँ)
+SW_C0, SW_C1 = (205, 0, 12), (145, 0, 22)        # wipe को रङ
 
 
 def chev(bh, i):
@@ -511,7 +683,7 @@ def bar_pngs(prefix, headline):
     d = ImageDraw.Draw(bar)
     for x in range(CW - 40, BW):
         t = (x - CW) / (BW - CW)
-        d.line((x, 0, x, bh), fill=(int(215 - 45 * t), 0, int(10 + 5 * t), 255))
+        d.line((x, 0, x, bh), fill=tuple(int(BAR_C0[k] + (BAR_C1[k] - BAR_C0[k]) * t) for k in range(3)) + (255,))
     d.polygon([(0, 0), (CW, 0), (CW - 42, bh), (0, bh)], fill=(240, 240, 240, 255))
     for i, col in enumerate([(220, 30, 30), (245, 130, 20), (250, 190, 20)]):
         d.line(chev(bh, i), fill=col + (255,), width=17, joint="curve")
@@ -535,26 +707,48 @@ def bar_pngs(prefix, headline):
     return bar_path, whites
 
 
-SWEEP_W = W + 500
+RW, AW, NW, SL = W + 900, 90, 110, 170        # लाल पट्टी, सेतो धार, नीलो धार, तिरछोपन
+X0 = -(RW + AW + SL + 150)
+SPAN = W + NW + 100 - X0
+TT = 0.9                                          # एक transition को कुल समय
+LAYERS = [("white", AW, RW, 0.0), ("red", RW, 0, 0.025), ("navy", NW, -NW, 0.06)]
 
 
-def sweep_png(path):
-    """दृश्य बदलिँदा पर्दाभरि सर्ने रातो wipe (logo सहित)।"""
-    img = Image.new("RGBA", (SWEEP_W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    for x in range(SWEEP_W):
-        t = x / SWEEP_W
-        d.line((x, 0, x, H), fill=(int(205 - 60 * t), 0, int(12 + 10 * t), 255))
-    mask = Image.new("L", (SWEEP_W, H), 0)
-    ImageDraw.Draw(mask).polygon([(160, 0), (SWEEP_W, 0), (SWEEP_W - 160, H), (0, H)], fill=255)
-    img.putalpha(mask)
-    d = ImageDraw.Draw(img)
-    d.polygon([(SWEEP_W - 330, 0), (SWEEP_W - 290, 0), (SWEEP_W - 450, H), (SWEEP_W - 490, H)],
-              fill=(255, 255, 255, 235))
-    logo = Image.open("logo.png").convert("RGBA").resize((420, 420))
-    img.alpha_composite(logo, ((SWEEP_W - 420) // 2, (H - 420) // 2))
+def band_png(path, w, kind):
+    img = Image.new("RGBA", (w + SL, H), (0, 0, 0, 0))
+    mask = Image.new("L", (w + SL, H), 0)
+    ImageDraw.Draw(mask).polygon([(SL, 0), (w + SL, 0), (w, H), (0, H)], fill=255)
+    fill = Image.new("RGBA", (w + SL, H), (0, 0, 0, 255))
+    d = ImageDraw.Draw(fill)
+    if kind == "white":
+        d.rectangle((0, 0, w + SL, H), fill=(255, 255, 255, 255))
+    elif kind == "navy":
+        d.rectangle((0, 0, w + SL, H), fill=(11, 31, 92, 255))
+    else:
+        for x in range(w + SL):
+            t = x / (w + SL)
+            d.line((x, 0, x, H), fill=tuple(int(SW_C0[k] + (SW_C1[k] - SW_C0[k]) * t) for k in range(3)) + (255,))
+        # हल्का चमक (gloss) धार
+        d.polygon([(w - 60, 0), (w - 20, 0), (w - 20 - SL, H), (w - 60 - SL, H)], fill=(255, 255, 255, 40))
+    img.paste(fill, (0, 0), mask)
     img.save(path)
     return path
+
+
+def sweep_layers(prefix):
+    """व्यावसायिक तीन-तह wipe (सेतो धार, रातो पट्टी, नीलो धार) - logo बिना।"""
+    return [band_png(f"{prefix}_{k}.png", w, k) for k, w, _, _ in LAYERS]
+
+
+def _S(arg):
+    p = f"clip(({arg})/{TT},0,1)"
+    return f"{p}*{p}*(3-2*{p})"                   # smoothstep: सुरुमा ढिलो, बीचमा छिटो, अन्त्यमा ढिलो
+
+
+def layer_x(ox, delay, D, first, last):
+    start = "1" if first else _S(f"t+0.45-{delay}")
+    end = "0" if last else _S(f"t-({D - 0.45:.3f})-{delay}")
+    return f"{ox}+({X0})+{SPAN}*if(lt(t,{D / 2:.3f}),{start},{end})"
 
 
 def thumbnail(path, title, photo):
@@ -567,7 +761,7 @@ def thumbnail(path, title, photo):
         bg = Image.open(fallback_bg(f"{OUT}/_bg.png")).convert("RGB")
     bg = Image.alpha_composite(bg.convert("RGBA"), Image.new("RGBA", (W, H), (5, 12, 40, 150)))
     d = ImageDraw.Draw(bg)
-    logo = Image.open("logo.png").convert("RGBA").resize((170, 170))
+    logo = load_logo(170)
     bg.paste(logo, (50, 40), logo)
     f = font(120)
     lines = wrap(d, title, f, W - 160)[:3]
@@ -579,28 +773,85 @@ def thumbnail(path, title, photo):
 
 
 # ---------------------------------------------------------------- आवाज प्रभाव र सङ्गीत
+AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac")
+
+
+def audio_info(path):
+    """(अवधि सेकेन्ड, औसत आवाज dB)। ffmpeg को आउटपुटबाट पढ्ने।"""
+    p = subprocess.run([FFMPEG, "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    txt = p.stderr
+    dur, mean = 0.0, -30.0
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", txt)
+    if m:
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    m = re.search(r"mean_volume: (-?[\d.]+) dB", txt)
+    if m:
+        mean = float(m.group(1))
+    return dur, mean
+
+
+def scan_assets():
+    """repo मा राखिएका आवाज फाइल: सबैभन्दा छोटो (<=10s) = transition sound, लामा = news music।"""
+    files = [f for f in sorted(os.listdir(".")) if f.lower().endswith(AUDIO_EXT)]
+    info = {f: audio_info(f) for f in files}
+    trans, music = None, []
+    for f, (d, _) in info.items():
+        low = f.lower()
+        if any(k in low for k in ("transition", "whoosh", "swoosh", "effect")):
+            trans = f
+    if trans is None:
+        short = [f for f, (d, _) in info.items() if 0 < d <= 10]
+        if short:
+            trans = min(short, key=lambda f: info[f][0])
+    music = [f for f, (d, _) in info.items() if f != trans and d > 10]
+    print("आवाज फाइलहरू:", {f: f"{info[f][0]:.0f}s" for f in files}, "| transition:", trans, "| music:", music)
+    return trans, music, info
+
+
+def gain_to(mean_db, target):
+    return max(-25.0, min(25.0, target - mean_db))
+
+
 def make_whoosh(path):
+    """तपाईंको transition sound (भए), नभए आफैं बनाएको whoosh। आवाज बराबर बनाइन्छ।"""
+    trans, _, info = ASSETS
+    if trans:
+        g = gain_to(info[trans][1], -16.0)
+        run([FFMPEG, "-y", "-i", trans, "-t", "1.6", "-af",
+             f"volume={g:.1f}dB,afade=t=out:st=1.2:d=0.4", "-ar", "44100", "-ac", "2", path])
+        return path
     run([FFMPEG, "-y", "-f", "lavfi", "-i",
          "anoisesrc=d=0.7:c=pink:a=0.6,highpass=f=500,lowpass=f=4500,"
-         "afade=t=in:d=0.3,afade=t=out:st=0.35:d=0.35", "-ar", "44100", "-ac", "2", path])
+         "afade=t=in:d=0.3,afade=t=out:st=0.35:d=0.35,volume=3", "-ar", "44100", "-ac", "2", path])
     return path
 
 
-def make_music(path):
-    """repo मा music.mp3 छ भने त्यही; नभए आफैं समाचार-शैलीको सरल सङ्गीत बनाउने।"""
-    if os.path.exists("music.mp3"):
-        return "music.mp3"
-    expr = ("0.20*sin(2*PI*110*t)*(0.6+0.4*sin(2*PI*2*t))"
-            "+0.12*sin(2*PI*165*t)*(0.5+0.5*sin(2*PI*1*t))"
-            "+0.09*sin(2*PI*220*t)*(0.5+0.5*sin(2*PI*0.5*t))"
-            "+0.07*sin(2*PI*330*t)*(0.5+0.5*sin(2*PI*2*t+1.5))")
-    run([FFMPEG, "-y", "-f", "lavfi", "-i", f"aevalsrc='{expr}':s=44100:d=60:c=stereo",
-         "-af", "lowpass=f=1800,aecho=0.8:0.6:60:0.3", path])
-    return path
+def make_music(path, style="news", pick=0):
+    """तपाईंको news music (भए) मध्ये एउटा; नभए आफैं बनाएको सरल सङ्गीत। (path, gain_dB) फर्काउँछ।"""
+    _, music, info = ASSETS
+    if music:
+        f = music[pick % len(music)]
+        print("music:", f)
+        return f, gain_to(info[f][1], MUSIC_TARGET_DB)
+    if style == "calm":
+        expr = ("0.16*sin(2*PI*196*t)*(0.7+0.3*sin(2*PI*0.20*t))"
+                "+0.12*sin(2*PI*246.94*t)*(0.7+0.3*sin(2*PI*0.25*t+1))"
+                "+0.10*sin(2*PI*293.66*t)*(0.7+0.3*sin(2*PI*0.15*t+2))"
+                "+0.05*sin(2*PI*392*t)*(0.5+0.5*sin(2*PI*0.10*t))")
+        af = "lowpass=f=1200,aecho=0.8:0.7:120:0.35"
+    else:
+        expr = ("0.20*sin(2*PI*110*t)*(0.6+0.4*sin(2*PI*2*t))"
+                "+0.12*sin(2*PI*165*t)*(0.5+0.5*sin(2*PI*1*t))"
+                "+0.09*sin(2*PI*220*t)*(0.5+0.5*sin(2*PI*0.5*t))"
+                "+0.07*sin(2*PI*330*t)*(0.5+0.5*sin(2*PI*2*t+1.5))")
+        af = "lowpass=f=1800,aecho=0.8:0.6:60:0.3"
+    run([FFMPEG, "-y", "-f", "lavfi", "-i", f"aevalsrc='{expr}':s=44100:d=60:c=stereo", "-af", af, path])
+    return path, gain_to(audio_info(path)[1], MUSIC_TARGET_DB)
 
 
 # ---------------------------------------------------------------- भिडियो
-def make_clip(idx, kind, media, audio, dur, bar, whites, frame, sweep, whoosh, first, last):
+def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, first, last):
     n = int(dur * 25) + 12
     if kind == "video":
         pre = ["-stream_loop", "-1", "-i", media]
@@ -611,36 +862,31 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, sweep, whoosh, f
         vf = ("scale=2112:1188:force_original_aspect_ratio=increase,crop=2112:1188,"
               f"zoompan=z='min(1+0.0004*on,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={n}:s=1920x1080:fps=25")
     cmd = [FFMPEG, "-y"] + pre + ["-i", audio]
-    for p in [frame, bar] + whites + [sweep]:
+    for p in [frame, bar] + whites + layers[::-1]:       # layers: नीलो, रातो, सेतो (तल देखि माथि)
         cmd += ["-loop", "1", "-framerate", "25", "-i", p]
     if not last:
         cmd += ["-i", whoosh]
 
-    s0 = 0.15 if first else 0.5          # शीर्षक पट्टी स्लाइड सुरु हुने समय
+    s0 = 0.15 if first else 0.55          # शीर्षक पट्टी स्लाइड सुरु हुने समय (transition पछि)
     bx = f"if(lt(t,{s0}),-3000,if(lt(t,{s0 + 0.5}),-w+(260+w)*(t-{s0})/0.5,260))"
-    out_start = dur - 0.45
-    sx = (f"if(lt(t,0.45),-300+({W}+350)*t/0.45,"
-          f"if(gt(t,{out_start:.2f}),-{SWEEP_W}+({SWEEP_W}-300)*(t-{out_start:.2f})/0.45,-5000))")
-    if first:
-        sx = f"if(gt(t,{out_start:.2f}),-{SWEEP_W}+({SWEEP_W}-300)*(t-{out_start:.2f})/0.45,-5000)"
-    if last:
-        sx = "if(lt(t,0.45),-300+(%d+350)*t/0.45,-5000)" % W
-        if first:
-            sx = "-5000"
 
+    # layers = [white, red, navy]; इनपुट क्रम 7=navy, 8=red, 9=white
+    lx = {name: layer_x(ox, dl, dur, first, last) for name, _, ox, dl in LAYERS}
     fc = (f"[0:v]{vf}[bg];"
           f"[bg][2:v]overlay=0:0:format=auto[v1];"
           f"[3:v][4:v]overlay=0:0:format=auto:enable='between(mod(t,1.8),0.15,0.45)'[b1];"
           f"[b1][5:v]overlay=0:0:format=auto:enable='between(mod(t,1.8),0.35,0.65)'[b2];"
           f"[b2][6:v]overlay=0:0:format=auto:enable='between(mod(t,1.8),0.55,0.85)'[b3];"
           f"[v1][b3]overlay=x='{bx}':y=H-h-45:format=auto[v2];"
-          f"[v2][7:v]overlay=x='{sx}':y=0:format=auto[v];"
+          f"[v2][7:v]overlay=x='{lx['navy']}':y=0:format=auto[v3];"
+          f"[v3][8:v]overlay=x='{lx['red']}':y=0:format=auto[v4];"
+          f"[v4][9:v]overlay=x='{lx['white']}':y=0:format=auto[v];"
           f"[1:a]atempo={SPEED},apad[nar]")
     if last:
         amap = "[nar]"
     else:
-        ms = max(0, int((dur - 0.6) * 1000))
-        fc += (f";[8:a]adelay={ms}|{ms},volume=3.0[wh];"
+        ms = max(0, int((dur - 0.7) * 1000))
+        fc += (f";[10:a]adelay={ms}|{ms}[wh];"
                f"[nar][wh]amix=inputs=2:duration=first:normalize=0[a]")
         amap = "[a]"
     clip = f"{OUT}/clip{idx}.mp4"
@@ -651,14 +897,14 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, sweep, whoosh, f
     return os.path.basename(clip)
 
 
-def concat(clips, final, music):
+def concat(clips, final, music, gain_db):
     with open(f"{OUT}/list.txt", "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
     raw = f"{OUT}/_nomusic.mp4"
     run([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", f"{OUT}/list.txt", "-c", "copy", raw])
     run([FFMPEG, "-y", "-i", raw, "-stream_loop", "-1", "-i", music, "-filter_complex",
-         f"[1:a]volume={MUSIC_VOLUME}[m];[0:a][m]amix=inputs=2:duration=first:normalize=0[a]",
+         f"[1:a]volume={gain_db:.1f}dB[m];[0:a][m]amix=inputs=2:duration=first:normalize=0[a]",
          "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", final])
 
 
@@ -680,8 +926,8 @@ def upload(video, thumb, meta):
     yt = build("youtube", "v3", credentials=creds)
     body = {
         "snippet": {"title": meta["title"][:100], "description": meta["description"][:4900],
-                    "tags": ["नेपाल", "समाचार", "हाम्रै खबर", "Nepal news", "Hamrai Khabar"],
-                    "categoryId": "25", "defaultLanguage": "ne"},
+                    "tags": meta.get("tags", ["नेपाल", "समाचार", "हाम्रै खबर", "Nepal news", "Hamrai Khabar"]),
+                    "categoryId": meta.get("category", "25"), "defaultLanguage": "ne"},
         "status": {"privacyStatus": PRIVACY, "selfDeclaredMadeForKids": False,
                    "containsSyntheticMedia": True},
     }
@@ -708,16 +954,25 @@ def main():
     items = data["items"]
     print(f"{len(items)} items, title: {data['title']}")
 
-    frame = frame_png(f"{OUT}/frame.png")
-    sweep = sweep_png(f"{OUT}/sweep.png")
+    global ASSETS
+    ASSETS = scan_assets()
+    layers = sweep_layers(f"{OUT}/sw")
     whoosh = make_whoosh(f"{OUT}/whoosh.wav")
-    music = make_music(f"{OUT}/music_bed.mp3")
+    music, music_gain = make_music(f"{OUT}/music_bed.mp3", pick=(0 if MODE == "morning" else 1))
 
     clips, credits, total, thumb_src = [], [], 0.0, None
     for i, it in enumerate(items, 1):
         kind, media, credit = get_media(i, it, news)
         if credit:
             credits.append(credit)
+        try:
+            lab = "स्रोत: " + source_label(news[int(it["ref"]) - 1]["source"])
+        except Exception:
+            lab = ""
+        site = credit_site(credit)
+        if site:
+            lab += (" | " if lab else "") + "दृश्य: " + site
+        frame = frame_png(f"{OUT}/frame_{i}.png", lab or None)
         if thumb_src is None and media:
             if kind == "photo":
                 thumb_src = media
@@ -731,14 +986,14 @@ def main():
         audio = tts(it["narration"], f"{OUT}/a_{i}")
         dur = duration(audio) / SPEED + 0.6
         bar, whites = bar_pngs(f"{OUT}/h_{i}", it["headline"])
-        clips.append(make_clip(i, kind, media, audio, dur, bar, whites, frame, sweep, whoosh,
+        clips.append(make_clip(i, kind, media, audio, dur, bar, whites, frame, layers, whoosh,
                                first=(i == 1), last=(i == len(items))))
         total += dur
         print(f"clip {i} ok ({dur:.0f}s, media={kind})")
 
     print(f"कुल अवधि: {total / 60:.1f} मिनेट")
     final = f"{OUT}/final_{MODE}.mp4"
-    concat(clips, final, music)
+    concat(clips, final, music, music_gain)
 
     thumb = f"{OUT}/thumb_{MODE}.jpg"
     thumbnail(thumb, data["title"], thumb_src)
