@@ -104,9 +104,9 @@ def fetch_news():
 
 
 # ---------------------------------------------------------------- Gemini (लेखन)
-def pick_model():
+def pick_models():
+    """चल्न सक्ने Gemini model हरूको क्रमबद्ध सूची (एउटा व्यस्त भए अर्कोमा जान)।"""
     global NAMES
-    pref = os.environ.get("GEMINI_MODEL")
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                          headers={"x-goog-api-key": GEMINI_KEY}, params={"pageSize": 200}, timeout=60)
@@ -116,39 +116,48 @@ def pick_model():
                 NAMES.append(m["name"].split("/")[-1])
     except Exception as ex:
         print("model list failed:", ex)
+    order = []
+    pref = os.environ.get("GEMINI_MODEL")
     if pref:
-        return pref
+        order.append(pref)
     for p in ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
-              "gemini-2.5-flash", "gemini-4-hydrogen"]:
-        if p in NAMES:
-            return p
-    bad = ("tts", "live", "audio", "image", "embedding", "robotics", "computer")
-    cand = [n for n in NAMES if ("flash" in n or "hydrogen" in n) and not any(b in n for b in bad)]
-    if cand:
-        return sorted(cand)[-1]
-    raise SystemExit("चल्ने Gemini model भेटिएन।")
+              "gemini-2.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest",
+              "gemini-2.5-flash-lite", "gemini-3.5-flash-lite", "gemini-4-hydrogen"]:
+        if p in NAMES and p not in order:
+            order.append(p)
+    bad = ("tts", "live", "audio", "image", "embedding", "robotics", "computer", "omni", "transcribe")
+    for n in sorted(NAMES):
+        if ("flash" in n or "hydrogen" in n) and not any(x in n for x in bad) and n not in order:
+            order.append(n)
+    if not order:
+        raise SystemExit("चल्ने Gemini model भेटिएन।")
+    print("model order:", order[:6])
+    return order
 
 
 def gemini(prompt):
     global MODEL
     if MODEL is None:
-        MODEL = pick_model()
-        print("using model:", MODEL)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+        MODEL = pick_models()
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4,
                                  "maxOutputTokens": 16000}}
     last = None
-    for _ in range(3):
-        try:
-            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=240)
-            r.raise_for_status()
-            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(txt)
-        except Exception as ex:
-            last = ex
-            print("gemini retry:", ex)
-            time.sleep(20)
+    for rnd in range(3):                       # तीन चक्कर, हरेक model एक-एक पटक
+        for model in MODEL[:6]:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            try:
+                r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=240)
+                r.raise_for_status()
+                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                data = json.loads(txt)
+                print("gemini ok with:", model)
+                return data
+            except Exception as ex:
+                last = ex
+                print("gemini retry:", model, str(ex)[:120])
+                time.sleep(5)
+        time.sleep(30 * (rnd + 1))             # सबै व्यस्त भए केही बेर पर्खने
     raise SystemExit(f"Gemini failed: {last}")
 
 
