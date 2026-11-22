@@ -268,19 +268,21 @@ def edge_tts_file(text, path):
 
 def make_voices(items):
     """सबै भागको आवाज एउटै इन्जिन (एउटै वाचक) बाट बनाउँछ, ताकि बीचबीचमा आवाज नफेरियोस्।
-    Gemini बारम्बार प्रयास गर्छ; सबै प्रयास फेल भए मात्र सबै भाग Edge आवाजमा बनाउँछ।"""
-    use_gemini = bool(GEMINI_KEY)
+    Gemini २ पटक प्रयास गर्छ; फेल (जस्तै 429 quota) भए सबै भाग Edge आवाजमा बनाउँछ।
+    env TTS_ENGINE=edge राखे सिधै Edge (छिटो, quota नचाहिने)।"""
+    engine = os.environ.get("TTS_ENGINE", "auto").lower()      # auto / gemini / edge
+    use_gemini = bool(GEMINI_KEY) and engine != "edge"
     raws = []
     if use_gemini:
         for i, it in enumerate(items, 1):
             path, ok = f"{OUT}/raw_a_{i}.wav", False
-            for attempt in range(6):
+            for attempt in range(2):                              # धेरै कुर्दैन: २ पटक मात्र
                 if gemini_tts(it["narration"], path):
                     ok = True
                     break
-                time.sleep(min(60, 5 * 2 ** attempt))
+                time.sleep(20)
             if not ok:
-                print(f"Gemini आवाज भाग {i} मा फेल; एउटै आवाज राख्न सबै Edge मा बनाइँदैछ")
+                print(f"Gemini आवाज (quota/429) भाग {i} मा रोकियो; एउटै आवाज राख्न सबै Edge मा बनाइँदैछ")
                 use_gemini = False
                 break
             raws.append(path)
