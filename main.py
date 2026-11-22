@@ -4,7 +4,14 @@ Usage:  python main.py morning     (10 मुख्य समाचार, ~4 mi
         python main.py afternoon   (आजको सबैभन्दा चर्चित विषय, ~3-4 min)
 """
 import os, sys, json, re, glob, subprocess, datetime, asyncio, time
+import shutil
 import requests, feedparser
+from mutagen.mp3 import MP3
+try:
+    import imageio_ffmpeg
+    FFMPEG = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG = "ffmpeg"
 from PIL import Image, ImageDraw, ImageFont
 import edge_tts
 
@@ -218,9 +225,7 @@ def slide(path, headline, number=None, size=(W, H)):
 
 
 def duration(path):
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                          "-of", "csv=p=0", path], capture_output=True, text=True)
-    return float(out.stdout.strip())
+    return MP3(path).info.length
 
 
 # ---------------------------------------------------------------- भिडियो
@@ -228,14 +233,14 @@ def build_video(segments, final):
     clips = []
     for i, (img, aud) in enumerate(segments):
         c = f"{OUT}/clip{i}.mp4"
-        run(["ffmpeg", "-y", "-loop", "1", "-i", img, "-i", aud, "-c:v", "libx264",
+        run([FFMPEG, "-y", "-loop", "1", "-i", img, "-i", aud, "-c:v", "libx264",
              "-tune", "stillimage", "-r", "25", "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
              "-ac", "2", "-pix_fmt", "yuv420p", "-shortest", c])
         clips.append(os.path.basename(c))
     with open(f"{OUT}/list.txt", "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", f"{OUT}/list.txt", "-c", "copy", final])
+    run([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", f"{OUT}/list.txt", "-c", "copy", final])
 
 
 # ---------------------------------------------------------------- YouTube
