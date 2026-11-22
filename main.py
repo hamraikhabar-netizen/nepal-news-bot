@@ -4,6 +4,11 @@ Usage:  python main.py morning     (10 मुख्य समाचार, ~4 mi
         python main.py afternoon   (आजको सबैभन्दा चर्चित विषय, ~3-4 min)
 """
 import os, sys, io, json, re, glob, wave, base64, shutil, subprocess, datetime, asyncio, time
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 import requests, feedparser
 from html import unescape
 from urllib.parse import urljoin, urlparse
@@ -303,7 +308,7 @@ def duration(path):
 # ---------------------------------------------------------------- फोटो / भिडियो
 def download(url, path, minw=600):
     try:
-        r = requests.get(url, headers=UA, timeout=40)
+        r = requests.get(url, headers=UA, timeout=20)
         r.raise_for_status()
         im = Image.open(io.BytesIO(r.content)).convert("RGB")
         if im.width < minw:
@@ -502,7 +507,7 @@ def article_page(n):
     if not link or "news.google.com" in link:      # Google News को लिङ्क सिधै पेज होइन
         return "", link
     try:
-        r = requests.get(link, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        r = requests.get(link, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r.raise_for_status()
         return r.text, r.url
     except Exception as ex:
@@ -512,7 +517,7 @@ def article_page(n):
 
 def _ahash(path):
     im = Image.open(path).convert("L").resize((8, 8))
-    px = list(im.getdata())
+    px = list(im.tobytes())
     avg = sum(px) / 64
     return [1 if p > avg else 0 for p in px]
 
@@ -537,7 +542,7 @@ def article_media(n, idx, want_video=True, max_photos=3):
             cands.append(m.group(1))
     photos, hashes, tried = [], [], 0
     for u in cands:
-        if len(photos) >= max_photos or tried >= 14:
+        if len(photos) >= max_photos or tried >= 10:
             break
         u = urljoin(base, u)
         if not u.lower().startswith("http") or any(b in u.lower() for b in BAD_IMG):
@@ -696,7 +701,8 @@ def logo_badge(h, maxw, padx=28, pady=14):
     if lg.getchannel("A").getextrema()[0] == 255:
         return lg
     small = lg.resize((24, 24))
-    pts = [p for p in small.getdata() if p[3] > 128]
+    raw = small.tobytes()
+    pts = [raw[i:i + 4] for i in range(0, len(raw), 4) if raw[i + 3] > 128]
     lum = sum(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] for p in pts) / len(pts) if pts else 0
     plate = (11, 31, 92, 225) if lum > 160 else (255, 255, 255, 235)
     out = Image.new("RGBA", (lg.width + 2 * padx, lg.height + 2 * pady), (0, 0, 0, 0))
@@ -1171,11 +1177,15 @@ def main():
     whoosh = make_whoosh(f"{OUT}/whoosh.wav")
     music, music_gain = make_music(f"{OUT}/music_bed.mp3", pick=(0 if MODE == "morning" else 1))
 
+    t_v = time.time()
     voices = make_voices(items)          # सबै भागको आवाज एउटै वाचकमा, बराबर चर्काइमा
 
+    print(f"आवाज तयार: {time.time() - t_v:.0f}s")
     clips, credits, total, thumb_src = [], [], 0.0, None
     for i, it in enumerate(items, 1):
+        t0 = time.time()
         kind, media, credit = get_media(i, it, news)
+        print(f"भाग {i}: मिडिया {kind} ({len(media)}) {time.time() - t0:.0f}s, type={it.get('type')}")
         if credit:
             credits.append(credit)
         lab = video_label(credit) if kind == "video" else None
@@ -1197,7 +1207,7 @@ def main():
         clips.append(make_clip(i, kind, media, voices[i - 1], dur, bar, whites, frame, layers, whoosh,
                                card, first, last, lead))
         total += dur
-        print(f"clip {i} ok ({dur:.0f}s, media={kind}, {len(media)} वटा)")
+        print(f"clip {i} ok ({dur:.0f}s, media={kind}, {len(media)} वटा, कुल {time.time() - t0:.0f}s)")
 
     print(f"कुल अवधि: {total / 60:.1f} मिनेट")
     final = f"{OUT}/final_{MODE}.mp4"
