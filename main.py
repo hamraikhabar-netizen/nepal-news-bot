@@ -50,6 +50,8 @@ FEEDS = [
     "https://www.onlinekhabar.com/feed",
     "https://www.setopati.com/feed",
     "https://feeds.bbci.co.uk/nepali/rss.xml",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",      # BBC World (अंग्रेजी)
+    "https://rss.cnn.com/rss/edition_world.rss",        # CNN World (अंग्रेजी)
     "https://news.google.com/rss/search?q=%E0%A4%A8%E0%A5%87%E0%A4%AA%E0%A4%BE%E0%A4%B2&hl=ne&gl=NP&ceid=NP:ne",
     "https://news.google.com/rss/headlines/section/topic/WORLD?hl=ne&gl=NP&ceid=NP:ne",
 ]
@@ -524,6 +526,54 @@ def _ahash(path):
     return [1 if p > avg else 0 for p in px]
 
 
+DOMAIN_NAMES = {
+    "reuters.com": "Reuters", "cnn.com": "CNN", "bbc.co.uk": "BBC", "bbc.com": "BBC",
+    "aninews.in": "ANI", "ptinews.com": "PTI", "pib.gov.in": "PIB India", "pmindia.gov.in": "PMO India",
+    "opmcm.gov.np": "PMO Nepal", "pmo.gov.np": "PMO Nepal", "rss.com.np": "राससस",
+    "risingnepaldaily.com": "राससस", "nepalphotolibrary.com": "Nepal Photo Library",
+    "onlinekhabar.com": "अनलाइनखबर", "setopati.com": "सेतोपाटी", "ratopati.com": "रातोपाटी",
+    "kathmandupost.com": "The Kathmandu Post", "ekantipur.com": "कान्तिपुर",
+}
+
+
+def courtesy_name(host, fallback=""):
+    host = (host or "").lower()
+    for k, v in DOMAIN_NAMES.items():
+        if host == k or host.endswith("." + k):
+            return v
+    return fallback or re.sub(r"^www\.", "", host)
+
+
+def find_video_urls(page, base):
+    """पेजमा खुला रूपमा देखिएका भिडियोको URL (mp4 / m3u8)। DRM वा लग-इन चाहिने कुरा छोइँदैन।"""
+    urls = list(_meta(page, ("og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream")))
+    urls += re.findall(r'<(?:video|source)[^>]+src=["\']([^"\']+)["\']', page, re.I)
+    urls += re.findall(r'["\'](https?:[^"\'\s<>]+?\.(?:mp4|m3u8)[^"\'\s<>]*)["\']', page, re.I)
+    out = []
+    for u in urls:
+        u = urljoin(base, unescape(u).replace("\\/", "/"))
+        low = u.lower()
+        if (".mp4" in low or ".m3u8" in low) and u not in out and "preview" not in low and "/ads/" not in low and "advert" not in low:
+            out.append(u)
+    return out[:6]
+
+
+def grab_video(url, path):
+    """mp4 सिधै डाउनलोड; m3u8 (HLS) भए ffmpeg ले ४५ सेकेन्डसम्म। सफल भए True।"""
+    try:
+        if ".m3u8" in url.lower():
+            p = subprocess.run([FFMPEG, "-y", "-user_agent", "Mozilla/5.0", "-i", url, "-t", "45",
+                                "-c", "copy", "-bsf:a", "aac_adtstoasc", path],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            ok = p.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 50000
+        else:
+            ok = download_file(url, path)
+        return ok and audio_info(path)[0] >= 4
+    except Exception as ex:
+        print("video grab fail:", str(ex)[:100])
+        return False
+
+
 def article_media(n, idx, want_video=True, max_photos=3):
     """समाचारकै पेजबाट सम्बन्धित भिडियो (भए) वा २-३ फोटो लिने।
     फर्काउँछ: ("video", [path], credit) | ("photo", [paths], "") | None"""
@@ -531,14 +581,11 @@ def article_media(n, idx, want_video=True, max_photos=3):
     cands = [n["image"]] if n.get("image") else []
     if page:
         if want_video:
-            for v in _meta(page, ("og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream")):
-                if ".mp4" in v.lower():
-                    path = f"{OUT}/raw_{idx}.mp4"
-                    if download_file(urljoin(base, v), path):
-                        d = audio_info(path)[0]
-                        if d >= 4:
-                            host = re.sub(r"^www\.", "", urlparse(base).netloc)
-                            return "video", [path], f"भिडियो साभार: {source_label(n.get('source', '')) or host}"
+            for v in find_video_urls(page, base):
+                path = f"{OUT}/raw_{idx}.mp4"
+                if grab_video(v, path):
+                    name = courtesy_name(urlparse(base).netloc, source_label(n.get("source", "")))
+                    return "video", [path], f"भिडियो साभार: {name}"
         cands += _meta(page, ("og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"))
         for m in re.finditer(r'<img[^>]+?(?:data-src|data-lazy-src|src)=["\']([^"\']+)["\']', page, re.I):
             cands.append(m.group(1))
@@ -562,6 +609,28 @@ def article_media(n, idx, want_video=True, max_photos=3):
         hashes.append(h)
         photos.append(path)
     return ("photo", photos, "") if photos else None
+
+
+def top_up_photos(photos, credits, iqs, vq, idx, want=2):
+    """समाचारको पेजमा १ फोटो मात्र भए, खुला स्रोत (Wikimedia Commons / Pixabay) बाट थपेर कम्तीमा २ बनाउने।"""
+    k = len(photos)
+    for q in iqs:
+        if len(photos) >= want:
+            break
+        c = commons_search(q, False)
+        path = f"{OUT}/photo_{idx}_c{k}.jpg"
+        if c and download(c[0], path, minw=1000) and Image.open(path).width / Image.open(path).height >= 1.15:
+            photos.append(path)
+            credits.append(c[1])
+            k += 1
+    if len(photos) < want and vq:
+        p = pixabay_image(vq, idx)
+        if p:
+            new = f"{OUT}/photo_{idx}_p{k}.jpg"
+            os.replace(p[0], new)
+            photos.append(new)
+            credits.append(p[1])
+    return photos, credits
 
 
 def get_media(idx, item, news):
@@ -598,15 +667,21 @@ def get_media(idx, item, news):
 
     if ALLOW_ARTICLE_PHOTOS and n:                       # १) समाचारको आफ्नै पेजबाट
         am = article_media(n, idx)
-        if am:
+        if am and am[0] == "video":
             return am
+        if am and am[0] == "photo":
+            photos, cr = list(am[1]), []
+            if len(photos) < 2:
+                photos, cr = top_up_photos(photos, cr, iqs, vq, idx)
+            return "photo", photos, "\n".join(cr)
     if typ == "person_event":                            # २) खुला स्रोत
         r = commons_video_any(iqs, idx)
         if r:
             return "video", [r[0]], r[1]
         p = commons_photo(iqs, idx)
         if p:
-            return "photo", [p[0]], p[1]
+            ph, cr = top_up_photos([p[0]], [p[1]], iqs, vq, idx)
+            return "photo", ph, "\n".join(cr)
         r = stock()
         if r:
             return "video", [r[0]], r[1]
@@ -616,7 +691,8 @@ def get_media(idx, item, news):
             return "video", [r[0]], r[1]
         p = commons_photo(iqs, idx)
         if p:
-            return "photo", [p[0]], p[1]
+            ph, cr = top_up_photos([p[0]], [p[1]], iqs, vq, idx)
+            return "photo", ph, "\n".join(cr)
     return None, [], ""
 
 
@@ -658,6 +734,9 @@ def find_logo():
         return env
     pngs = sorted(f for f in os.listdir(".") if f.lower().endswith(".png"))
     print("repo मा भेटिएका png:", pngs)
+    for f in pngs:
+        if f.startswith("file_0000000029c88211b3f223523608709b"):    # तपाईंले दिएको logo
+            return f
     for key in ("hamrai", "khabar", "hamr", "logo", "hk"):
         for f in pngs:
             if key in f.lower():
@@ -804,7 +883,7 @@ def video_label(credit):
 
 BW, CW = 1400, 240
 BAR_C0, BAR_C1 = (215, 0, 10), (170, 0, 15)      # शीर्षक पट्टीको रङ (बायाँ -> दायाँ)
-SW_C0, SW_C1 = (205, 0, 12), (145, 0, 22)        # wipe को रङ
+SW_C0, SW_C1 = (16, 42, 118), (6, 16, 52)          # wipe को मुख्य पट्टी (गाढा नीलो)
 
 
 def chev(bh, i):
@@ -859,7 +938,7 @@ def bar_pngs(prefix, headline):
     return bar_path, whites
 
 
-RW, AW, NW, SL = W + 900, 90, 110, 170        # लाल पट्टी, सेतो धार, नीलो धार, तिरछोपन
+RW, AW, NW, SL = W + 900, 30, 16, 170         # मुख्य पट्टी, अगाडिको रातो धार, पछाडिको सेतो धार, तिरछोपन
 X0 = -(RW + AW + SL + 150)
 SPAN = W + NW + 100 - X0
 TT = 0.9                                          # एक transition को कुल समय
@@ -872,10 +951,10 @@ def band_png(path, w, kind):
     ImageDraw.Draw(mask).polygon([(SL, 0), (w + SL, 0), (w, H), (0, H)], fill=255)
     fill = Image.new("RGBA", (w + SL, H), (0, 0, 0, 255))
     d = ImageDraw.Draw(fill)
-    if kind == "white":
-        d.rectangle((0, 0, w + SL, H), fill=(255, 255, 255, 255))
-    elif kind == "navy":
-        d.rectangle((0, 0, w + SL, H), fill=(11, 31, 92, 255))
+    if kind == "white":                      # अगाडिको पातलो रातो धार
+        d.rectangle((0, 0, w + SL, H), fill=(215, 0, 10, 255))
+    elif kind == "navy":                     # पछाडिको पातलो सेतो धार
+        d.rectangle((0, 0, w + SL, H), fill=(255, 255, 255, 235))
     else:
         for x in range(w + SL):
             t = x / (w + SL)
@@ -1025,6 +1104,7 @@ def make_music(path, style="news", pick=0):
 
 
 # ---------------------------------------------------------------- भिडियो
+FG_SCALE = 0.78       # भिडियोको अगाडिको भाग स्क्रिनको कति भाग (0.78 = ७८%); पछाडि धमिलो ठुलो भिडियो
 SLIDE_FADE = 0.6      # एक फोटोबाट अर्कोमा sliding हुने समय
 
 
@@ -1050,8 +1130,14 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, 
     if kind == "video" and imgs:
         pre = ["-stream_loop", "-1", "-i", imgs[0]]
         m = 1
-        fc = ("[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
-              "fps=25,setsar=1,format=yuv420p[bg];")
+        fw = int(W * FG_SCALE) // 2 * 2
+        fh = int(H * FG_SCALE) // 2 * 2
+        fc = ("[0:v]fps=25,setsar=1,split=2[va][vb];"
+              "[va]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
+              "scale=480:270,boxblur=7:2,scale=1920:1080,eq=brightness=-0.10:saturation=1.1[vbg];"
+              f"[vb]scale={fw}:{fh}:force_original_aspect_ratio=decrease,"
+              "pad=iw+8:ih+8:4:4:color=white@0.9[vfg];"
+              "[vbg][vfg]overlay=(W-w)/2:(H-h)/2-10,format=yuv420p[bg];")
     else:
         if not imgs:
             imgs = [fallback_bg(f"{OUT}/bg.png")]
