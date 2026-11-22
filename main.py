@@ -3,7 +3,7 @@
 Usage:  python main.py morning     (10 मुख्य समाचार, ~4 min)
         python main.py afternoon   (आजको सबैभन्दा चर्चित विषय, ~3-4 min)
 """
-import os, sys, json, re, glob, subprocess, datetime, asyncio
+import os, sys, json, re, glob, subprocess, datetime, asyncio, time
 import requests, feedparser
 from PIL import Image, ImageDraw, ImageFont
 import edge_tts
@@ -16,7 +16,7 @@ os.makedirs(OUT, exist_ok=True)
 W, H = 1920, 1080
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = None  # आफैं छानिन्छ (pick_model)
 VOICE = os.environ.get("TTS_VOICE", "ne-NP-SagarNeural")
 PRIVACY = os.environ.get("UPLOAD_PRIVACY", "private")  # private / unlisted / public
 
@@ -70,20 +70,53 @@ def fetch_news():
 
 
 # ---------------------------------------------------------------- Gemini
+def pick_model():
+    """Google ले पुराना model बन्द गर्दै जान्छ, त्यसैले चल्ने model आफैं खोज्ने।"""
+    pref = os.environ.get("GEMINI_MODEL")
+    if pref:
+        return pref
+    names = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": GEMINI_KEY}, params={"pageSize": 200}, timeout=60)
+        r.raise_for_status()
+        for m in r.json().get("models", []):
+            if "generateContent" in m.get("supportedGenerationMethods", []):
+                names.append(m["name"].split("/")[-1])
+    except Exception as ex:
+        print("model list failed:", ex)
+    print("available models:", names)
+    for p in ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+              "gemini-2.5-flash", "gemini-4-hydrogen"]:
+        if p in names:
+            return p
+    bad = ("tts", "live", "audio", "image", "embedding", "robotics", "computer")
+    cand = [n for n in names if ("flash" in n or "hydrogen" in n) and not any(b in n for b in bad)]
+    if cand:
+        return sorted(cand)[-1]
+    raise SystemExit("चल्ने Gemini model भेटिएन। API key ठिक छ कि हेर्नुहोस्।")
+
+
 def gemini(prompt):
+    global MODEL
+    if MODEL is None:
+        MODEL = pick_model()
+        print("using model:", MODEL)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4}}
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4,
+                                 "maxOutputTokens": 16000}}
     last = None
     for _ in range(3):
         try:
-            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
+            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=240)
             r.raise_for_status()
             txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
             return json.loads(txt)
         except Exception as ex:
             last = ex
             print("gemini retry:", ex)
+            time.sleep(20)
     raise SystemExit(f"Gemini failed: {last}")
 
 
