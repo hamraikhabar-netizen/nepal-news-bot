@@ -2,31 +2,37 @@ name: Hamrai Khabar daily
 
 on:
   schedule:
-    - cron: "15 1 * * *"   # 7:00 AM Nepal time -> morning
-    - cron: "15 7 * * *"   # 1:00 PM Nepal time -> afternoon
+    - cron: "15 1 * * *"    # बिहान ७:०० (नेपाल) -> morning
+    - cron: "15 13 * * *"   # बेलुका ७:०० (नेपाल) -> afternoon
   workflow_dispatch:
     inputs:
       mode:
-        description: "morning or afternoon"
+        description: "morning वा afternoon"
         default: "morning"
+        type: choice
+        options: [morning, afternoon]
+
+concurrency:
+  group: hamrai-khabar
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    env:
+      MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (github.event.schedule == '15 13 * * *' && 'afternoon' || 'morning') }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install fonts and libs
-        run: sudo apt-get update && sudo apt-get install -y fonts-noto-core libraqm0 libfribidi0
-
-      - name: Install Python packages
-        run: pip install -r requirements.txt
-
+          cache: pip
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core libraqm0 libfribidi0
+      - run: pip install -r requirements.txt
       - name: Make video (and upload if YouTube secrets exist)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -35,20 +41,16 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-        run: |
-          MODE="${{ github.event.inputs.mode }}"
-          if [ -z "$MODE" ]; then
-            if [ "${{ github.event.schedule }}" = "15 1 * * *" ]; then MODE=morning; else MODE=afternoon; fi
-          fi
-          python main.py "$MODE"
-
+          UPLOAD_PRIVACY: ${{ vars.UPLOAD_PRIVACY || 'private' }}
+          TTS_ENGINE: ${{ vars.TTS_ENGINE || 'auto' }}
+        run: python main.py "$MODE"
       - name: Save video file
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: video
+          name: video-${{ env.MODE }}-${{ github.run_number }}
           path: |
             out/final_*.mp4
             out/thumb_*.jpg
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 3
