@@ -6,3 +6,4 @@ mutagen
 imageio-ffmpeg
 google-api-python-client
 google-auth
+nepali-datetime
