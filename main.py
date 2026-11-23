@@ -1,7 +1,14 @@
-"""हाम्रै खबर - daily Nepali news video bot (v2).
+"""हाम्रै खबर - daily Nepali news video bot (v2.1).
 
 Usage:  python main.py morning     (10 मुख्य समाचार, ~4 min)
         python main.py afternoon   (आजको सबैभन्दा चर्चित विषय, ~3-4 min)
+
+v2.1 मा के फेरियो:
+  - Gemini TTS मा 429 (quota) आएपछि पुनः प्रयास नगरी सिधै Edge आवाज (समय बच्छ)
+  - Wikimedia: ठीक User-Agent, अनुरोधबीच ढिलाइ, 429 मा पर्खाइ, धेरै 429 आए Wikimedia बन्द, खोजीको cache
+  - फोटो जाँच: content-type र PIL ले खोल्न सक्ने कि नसक्ने
+  - ffmpeg मा timeout; अड्किए सरल (zoom/slide बिनाको) तरिकाले क्लिप पुनः बनाउने
+  - zoompan हल्का (2400x1350), transition तहहरू आवश्यक बेला मात्र overlay
 """
 import os, sys, io, json, re, glob, wave, base64, shutil, subprocess, datetime, asyncio, time
 try:
@@ -30,6 +37,7 @@ GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Charon")  # वाचक आव�
 SPEED = 1.15          # वाचन गति (1.0 = सामान्य, 1.15 = अलि छिटो)
 MUSIC_TARGET_DB = -40  # पृष्ठभूमि सङ्गीतको औसत आवाज (dB); -34 = अलि चर्को, -44 = धेरै हल्का
 VOICE_LUFS = -15      # वाचनको चर्काइ (सबै भागमा बराबर बनाउन)
+CLIP_TIMEOUT = 420    # एउटा क्लिप बनाउन यति सेकेन्डभन्दा बढी लाग्यो भने सरल तरिकामा पुनः बनाउने
 # ================================================================================
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "morning"
@@ -38,7 +46,12 @@ NOW = datetime.datetime.now(NPT)
 OUT = "out"
 os.makedirs(OUT, exist_ok=True)
 W, H = 1920, 1080
-UA = {"User-Agent": "HamraiKhabarBot/1.0 (news video bot; contact via YouTube @hamraikhabar)"}
+
+# Wikimedia ले bot को नाम + सम्पर्क (email वा URL) माग्छ। BOT_CONTACT env मा आफ्नो email राख्दा राम्रो।
+BOT_CONTACT = os.environ.get("BOT_CONTACT", "https://www.youtube.com/@hamraikhabar")
+UA = {"User-Agent": f"HamraiKhabarBot/1.0 ({BOT_CONTACT}; Nepali news video bot)"}
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0 Safari/537.36"}
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = None
@@ -67,12 +80,20 @@ def deva(s):
 DATE_STR = deva(f"{NOW.day} {MONTHS[NOW.month - 1]} {NOW.year}")
 
 
-def run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+class FFError(Exception):
+    pass
+
+
+def run(cmd, timeout=900):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print("COMMAND TIMEOUT:", " ".join(cmd[:6]), "...")
+        raise FFError("ffmpeg timeout")
     if p.returncode != 0:
         print("COMMAND FAILED:", " ".join(cmd[:6]), "...")
         print(p.stderr[-1500:])
-        raise SystemExit("ffmpeg failed")
+        raise FFError("ffmpeg failed")
 
 
 # ---------------------------------------------------------------- समाचार
@@ -225,12 +246,18 @@ def make_prompt(listing):
 
 # ---------------------------------------------------------------- आवाज
 TTS_PREF = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+GEMINI_TTS_DEAD = False     # 429 (quota) आएपछि True; त्यसपछि Gemini आवाज फेरि प्रयास गरिँदैन
 
 
 def gemini_tts(text, path):
-    """Gemini को प्राकृतिक आवाज (wav)। सफल भए True।"""
+    """Gemini को प्राकृतिक आवाज (wav)। सफल भए True। सबै model मा 429 आए Gemini TTS बन्द (GEMINI_TTS_DEAD)।"""
+    global GEMINI_TTS_DEAD
+    if GEMINI_TTS_DEAD:
+        return False
     models = [m for m in TTS_PREF if m in NAMES] or [n for n in NAMES if "tts" in n]
+    tried, quota = 0, 0
     for m in models[:2]:
+        tried += 1
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
             body = {"contents": [{"parts": [{"text": text}]}],   # कुनै निर्देश नराख्ने, नत्र आवाजले त्यो पनि पढ्छ
@@ -248,8 +275,16 @@ def gemini_tts(text, path):
                 w.writeframes(pcm)
             time.sleep(3)
             return True
+        except requests.HTTPError as ex:
+            code = ex.response.status_code if ex.response is not None else 0
+            if code == 429:
+                quota += 1
+            print("gemini tts fail:", m, code, str(ex)[:120])
         except Exception as ex:
             print("gemini tts fail:", m, str(ex)[:200])
+    if tried and quota == tried:
+        GEMINI_TTS_DEAD = True
+        print("Gemini TTS quota सकियो (429): अब Gemini आवाज फेरि प्रयास गरिँदैन")
     return False
 
 
@@ -265,25 +300,21 @@ def edge_tts_file(text, path):
                 return True
         except Exception as ex:
             print("edge retry:", ex)
+            time.sleep(2)
     raise SystemExit("आवाज बनाउन सकिएन (Gemini र Edge दुवै फेल)")
 
 
 def make_voices(items):
     """सबै भागको आवाज एउटै इन्जिन (एउटै वाचक) बाट बनाउँछ, ताकि बीचबीचमा आवाज नफेरियोस्।
-    Gemini २ पटक प्रयास गर्छ; फेल (जस्तै 429 quota) भए सबै भाग Edge आवाजमा बनाउँछ।
+    Gemini मा एक पटक पनि फेल (जस्तै 429 quota) भए पर्खेर पुनः प्रयास नगरी सबै भाग Edge आवाजमा बनाउँछ।
     env TTS_ENGINE=edge राखे सिधै Edge (छिटो, quota नचाहिने)।"""
     engine = os.environ.get("TTS_ENGINE", "auto").lower()      # auto / gemini / edge
     use_gemini = bool(GEMINI_KEY) and engine != "edge"
     raws = []
     if use_gemini:
         for i, it in enumerate(items, 1):
-            path, ok = f"{OUT}/raw_a_{i}.wav", False
-            for attempt in range(2):                              # धेरै कुर्दैन: २ पटक मात्र
-                if gemini_tts(it["narration"], path):
-                    ok = True
-                    break
-                time.sleep(20)
-            if not ok:
+            path = f"{OUT}/raw_a_{i}.wav"
+            if not gemini_tts(it["narration"], path):
                 print(f"Gemini आवाज (quota/429) भाग {i} मा रोकियो; एउटै आवाज राख्न सबै Edge मा बनाइँदैछ")
                 use_gemini = False
                 break
@@ -309,12 +340,67 @@ def duration(path):
         return w.getnframes() / w.getframerate()
 
 
+# ---------------------------------------------------------------- Wikimedia (नरम तरिकाले)
+WM_GAP = 1.5          # Wikimedia का दुई अनुरोधबीचको न्यूनतम ढिलाइ (सेकेन्ड)
+WM_LAST = 0.0
+WM_429 = 0
+WM_OFF = False        # धेरै 429 आए बाँकी समयको लागि Wikimedia प्रयोग नगर्ने
+
+
+def is_wm(url):
+    h = urlparse(url).netloc.lower()
+    return h.endswith("wikimedia.org") or h.endswith("wikipedia.org")
+
+
+def wm_wait():
+    global WM_LAST
+    gap = WM_GAP - (time.time() - WM_LAST)
+    if gap > 0:
+        time.sleep(gap)
+    WM_LAST = time.time()
+
+
+def wm_get(url, timeout=30, **kw):
+    """Wikimedia को लागि GET: ढिलाइ + 429 मा पर्खाइ + धेरै 429 आए बन्द।"""
+    global WM_429, WM_OFF
+    if WM_OFF:
+        raise RuntimeError("wikimedia बन्द गरिएको (धेरै 429)")
+    for attempt in range(3):
+        wm_wait()
+        r = requests.get(url, headers=UA, timeout=timeout, **kw)
+        if r.status_code == 429:
+            WM_429 += 1
+            if WM_429 >= 4:
+                WM_OFF = True
+                print("Wikimedia मा धेरै 429: बाँकी समय Wikimedia प्रयोग गरिँदैन")
+                raise RuntimeError("wikimedia 429")
+            try:
+                wait = min(15, int(r.headers.get("Retry-After", 5)))
+            except Exception:
+                wait = 5
+            print(f"wikimedia 429, {wait}s पर्खने")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r
+    raise RuntimeError("wikimedia 429")
+
+
 # ---------------------------------------------------------------- फोटो / भिडियो
 def download(url, path, minw=600):
     try:
-        r = requests.get(url, headers=UA, timeout=20)
-        r.raise_for_status()
-        im = Image.open(io.BytesIO(r.content)).convert("RGB")
+        if is_wm(url):
+            r = wm_get(url, timeout=25)
+        else:
+            r = requests.get(url, headers=BROWSER_UA, timeout=20)
+            r.raise_for_status()
+        ct = r.headers.get("content-type", "").lower()
+        if ct and not (ct.startswith("image") or "octet" in ct):
+            print("image fail: फोटो होइन:", ct[:40], url[:80])
+            return False
+        im = Image.open(io.BytesIO(r.content))
+        im.load()
+        im = im.convert("RGB")
         if im.width < minw:
             return False
         im.save(path, quality=92)
@@ -326,7 +412,11 @@ def download(url, path, minw=600):
 
 def download_file(url, path, max_mb=90):
     try:
-        with requests.get(url, headers=UA, timeout=60, stream=True) as r:
+        if is_wm(url):
+            if WM_OFF:
+                return False
+            wm_wait()
+        with requests.get(url, headers=UA if is_wm(url) else BROWSER_UA, timeout=60, stream=True) as r:
             r.raise_for_status()
             size = 0
             with open(path, "wb") as f:
@@ -418,10 +508,10 @@ def pixabay_image(q, idx):
 
 def commons_video(q, idx):
     """Wikimedia Commons बाट खुला लाइसेन्सको भिडियो (कुञ्जी चाहिँदैन)।"""
-    if not q:
+    if not q or WM_OFF:
         return None
     try:
-        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=40, params={
+        r = wm_get("https://commons.wikimedia.org/w/api.php", timeout=40, params={
             "action": "query", "generator": "search", "gsrsearch": q + " filetype:video",
             "gsrnamespace": 6, "gsrlimit": 8, "prop": "imageinfo",
             "iiprop": "url|extmetadata|size|mime", "format": "json"})
@@ -444,19 +534,29 @@ def commons_video(q, idx):
     return None
 
 
+_CS_CACHE = {}
+
+
 def commons_search(q, newest=False):
-    """Wikimedia Commons बाट खुला लाइसेन्सको फोटो खोज्ने। newest=True भए नयाँ अपलोड पहिले।"""
+    """Wikimedia Commons बाट खुला लाइसेन्सको फोटो खोज्ने। newest=True भए नयाँ अपलोड पहिले।
+    एउटै खोजी दोहोरिए cache बाट (अनावश्यक अनुरोध नगर्न)।"""
+    key = (q, newest)
+    if key in _CS_CACHE:
+        return _CS_CACHE[key]
+    if WM_OFF:
+        return None
     params = {"action": "query", "generator": "search", "gsrsearch": q, "gsrnamespace": 6,
               "gsrlimit": 15, "prop": "imageinfo", "iiprop": "url|extmetadata|size|mime",
               "iiurlwidth": 1600, "format": "json"}
     if newest:
         params["gsrsort"] = "create_timestamp_desc"
     try:
-        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=40, params=params)
+        r = wm_get("https://commons.wikimedia.org/w/api.php", timeout=40, params=params)
         pages = r.json().get("query", {}).get("pages", {})
     except Exception as ex:
         print("commons fail:", str(ex)[:120])
         return None
+    result = None
     for p in sorted(pages.values(), key=lambda x: x.get("index", 99)):
         ii = (p.get("imageinfo") or [{}])[0]
         if ii.get("mime") not in ("image/jpeg", "image/png") or ii.get("width", 0) < 1000:
@@ -469,14 +569,18 @@ def commons_search(q, newest=False):
         if not (lic.startswith("CC") or "public domain" in lic.lower() or lic.lower().startswith("pd")):
             continue
         artist = clean(md.get("Artist", {}).get("value", "")) or "Wikimedia Commons"
-        return (ii.get("thumburl") or ii["url"]), f'"{title}" - {artist} ({lic}) via Wikimedia Commons'
-    return None
+        result = ((ii.get("thumburl") or ii["url"]), f'"{title}" - {artist} ({lic}) via Wikimedia Commons')
+        break
+    _CS_CACHE[key] = result
+    return result
 
 
 def commons_photo(queries, idx):
     path = f"{OUT}/photo_{idx}.jpg"
     for q in queries:
         for newest in (True, False):            # पहिले सबैभन्दा नयाँ, नभए सबैभन्दा मिल्ने
+            if WM_OFF:
+                return None
             c = commons_search(q, newest)
             if c and download(c[0], path):
                 return path, c[1]
@@ -615,7 +719,7 @@ def top_up_photos(photos, credits, iqs, vq, idx, want=2):
     """समाचारको पेजमा १ फोटो मात्र भए, खुला स्रोत (Wikimedia Commons / Pixabay) बाट थपेर कम्तीमा २ बनाउने।"""
     k = len(photos)
     for q in iqs:
-        if len(photos) >= want:
+        if len(photos) >= want or WM_OFF:
             break
         c = commons_search(q, False)
         path = f"{OUT}/photo_{idx}_c{k}.jpg"
@@ -1106,6 +1210,7 @@ def make_music(path, style="news", pick=0):
 # ---------------------------------------------------------------- भिडियो
 FG_SCALE = 0.78       # भिडियोको अगाडिको भाग स्क्रिनको कति भाग (0.78 = ७८%); पछाडि धमिलो ठुलो भिडियो
 SLIDE_FADE = 0.6      # एक फोटोबाट अर्कोमा sliding हुने समय
+ZW, ZH = 2400, 1350   # zoompan को लागि फोटो यति ठुलो बनाउने (पहिले 2880x1620; यो छिटो)
 
 
 def photo_branch(j, k, mode, nf):
@@ -1120,14 +1225,25 @@ def photo_branch(j, k, mode, nf):
         zp = f"z='1.12-0.12*on/{nf}':x='iw/2-(iw/zoom/2)':{cy}"
     else:
         zp = f"z='1.12':x='(iw-iw/zoom)*(1-on/{nf})':{cy}"
-    return (f"[{j}:v]scale=2880:1620:force_original_aspect_ratio=increase,crop=2880:1620,"
+    return (f"[{j}:v]scale={ZW}:{ZH}:force_original_aspect_ratio=increase,crop={ZW}:{ZH},"
             f"zoompan={zp}:d={nf}:s=1920x1080:fps=25,setsar=1,format=yuv420p[z{j}];")
 
 
-def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, card, first, last, lead):
+def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, card, first, last, lead,
+              simple=False):
+    """simple=True: zoom/slide/blur बिनाको सरल पृष्ठभूमि (मुख्य तरिका अड्किए/फेल भए पुनः प्रयासको लागि)।"""
     imgs = list(media or [])
     pre, fc = [], ""
-    if kind == "video" and imgs:
+    if simple:
+        if kind == "video" and imgs:
+            pre = ["-stream_loop", "-1", "-i", imgs[0]]
+        else:
+            src = imgs[0] if imgs else fallback_bg(f"{OUT}/bg.png")
+            pre = ["-loop", "1", "-framerate", "25", "-i", src]
+        m = 1
+        fc = ("[0:v]fps=25,scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
+              "setsar=1,format=yuv420p[bg];")
+    elif kind == "video" and imgs:
         pre = ["-stream_loop", "-1", "-i", imgs[0]]
         m = 1
         fw = int(W * FG_SCALE) // 2 * 2
@@ -1172,16 +1288,18 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, 
     bx = f"if(lt(t,{s0}),-3000,if(lt(t,{s0 + 0.5}),-w+(260+w)*(t-{s0})/0.5,260))"
     lx = {name: layer_x(ox, dl, dur, first, last) for name, _, ox, dl in LAYERS}
     card_x = f"{lx['red']}+({RW + SL}-w)/2"
+    # transition का तहहरू सुरु र अन्त्यको थोरै बेला मात्र देखिन्छन्; बाँकी समय overlay नगरी CPU बचाउने
+    en = f":enable='lt(t,1.0)+gte(t,{max(dur - T_IN - 0.2, 0):.3f})'"
 
     fc += (f"[bg][{iF}:v]overlay=0:0:format=auto[v1];"
            f"[{iB}:v][{iW0}:v]overlay=0:0:format=auto:enable='between(mod(t,1.8),0.15,0.45)'[b1];"
            f"[b1][{iW0 + 1}:v]overlay=0:0:format=auto:enable='between(mod(t,1.8),0.35,0.65)'[b2];"
            f"[b2][{iW0 + 2}:v]overlay=0:0:format=auto:enable='between(mod(t,1.8),0.55,0.85)'[b3];"
            f"[v1][b3]overlay=x='{bx}':y=H-h-45:format=auto[v2];"
-           f"[v2][{iNavy}:v]overlay=x='{lx['navy']}':y=0:format=auto[v3];"
-           f"[v3][{iRed}:v]overlay=x='{lx['red']}':y=0:format=auto[v4];"
-           f"[v4][{iCard}:v]overlay=x='{card_x}':y=(H-h)/2:format=auto[v5];"
-           f"[v5][{iWhite}:v]overlay=x='{lx['white']}':y=0:format=auto[v];")
+           f"[v2][{iNavy}:v]overlay=x='{lx['navy']}':y=0:format=auto{en}[v3];"
+           f"[v3][{iRed}:v]overlay=x='{lx['red']}':y=0:format=auto{en}[v4];"
+           f"[v4][{iCard}:v]overlay=x='{card_x}':y=(H-h)/2:format=auto{en}[v5];"
+           f"[v5][{iWhite}:v]overlay=x='{lx['white']}':y=0:format=auto{en}[v];")
     lead_ms = int(lead * 1000)
     fc += f"[{iA}:a]" + (f"adelay={lead_ms}|{lead_ms}," if lead_ms else "") + "apad[nar]"
     if last:
@@ -1193,9 +1311,10 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, 
         amap = "[a]"
     clip = f"{OUT}/clip{idx}.mp4"
     cmd += ["-filter_complex", fc, "-map", "[v]", "-map", amap,
-            "-c:v", "libx264", "-preset", "veryfast", "-r", "25", "-c:a", "aac", "-b:a", "160k",
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "0", "-r", "25",
+            "-c:a", "aac", "-b:a", "160k",
             "-ar", "44100", "-ac", "2", "-pix_fmt", "yuv420p", "-t", f"{dur:.2f}", clip]
-    run(cmd)
+    run(cmd, timeout=(300 if simple else CLIP_TIMEOUT))
     return os.path.basename(clip)
 
 
@@ -1284,16 +1403,20 @@ def main():
             else:
                 fp = f"{OUT}/vf_{i}.jpg"
                 try:
-                    run([FFMPEG, "-y", "-ss", "1", "-i", media[0], "-frames:v", "1", fp])
+                    run([FFMPEG, "-y", "-ss", "1", "-i", media[0], "-frames:v", "1", fp], timeout=60)
                     thumb_src = fp
-                except SystemExit:
+                except Exception:
                     pass
         first, last = (i == 1), (i == len(items))
         lead = 0.0 if first else 0.3                         # transition को बीचमा वाचन नसुरु होस्
         dur = duration(voices[i - 1]) + 0.6 + lead
         bar, whites = bar_pngs(f"{OUT}/h_{i}", it["headline"])
-        clips.append(make_clip(i, kind, media, voices[i - 1], dur, bar, whites, frame, layers, whoosh,
-                               card, first, last, lead))
+        args = (i, kind, media, voices[i - 1], dur, bar, whites, frame, layers, whoosh, card, first, last, lead)
+        try:
+            clips.append(make_clip(*args))
+        except FFError:
+            print(f"clip {i}: मुख्य तरिका फेल/अड्कियो, सरल तरिकाले पुनः बनाइँदैछ")
+            clips.append(make_clip(*args, simple=True))
         total += dur
         print(f"clip {i} ok ({dur:.0f}s, media={kind}, {len(media)} वटा, कुल {time.time() - t0:.0f}s)")
 
