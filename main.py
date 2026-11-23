@@ -79,6 +79,28 @@ def deva(s):
 
 DATE_STR = deva(f"{NOW.day} {MONTHS[NOW.month - 1]} {NOW.year}")
 
+BS_MONTHS = ["बैशाख", "जेठ", "असार", "श्रावण", "भदौ", "असोज", "कार्तिक", "मङ्सिर", "पौष", "माघ", "फागुन", "चैत"]
+BS_2083 = [31, 31, 32, 31, 31, 31, 30, 29, 30, 29, 30, 30]     # वि.सं. २०८३ का महिनाका दिन (nepali_datetime नभए यही)
+
+
+def bs_date_str():
+    """आजको वि.सं. मिति, जस्तै '२०८३ मङ्सिर ७ गते'। nepali_datetime भए त्यसबाट, नभए २०८३ को तालिकाबाट।"""
+    d = NOW.date()
+    try:
+        import nepali_datetime
+        n = nepali_datetime.date.from_datetime_date(d)
+        y, m, dd = n.year, n.month, n.day
+    except Exception:
+        off = (d - datetime.date(2026, 4, 14)).days
+        if not 0 <= off < sum(BS_2083):
+            return DATE_STR                       # तालिकाबाहिर भए अङ्ग्रेजी मिति
+        y, m = 2083, 0
+        while off >= BS_2083[m]:
+            off -= BS_2083[m]
+            m += 1
+        m, dd = m + 1, off + 1
+    return deva(f"{y} {BS_MONTHS[m - 1]} {dd} गते")
+
 
 class FFError(Exception):
     pass
@@ -863,6 +885,12 @@ def raw_logo():
         f = font(150)
         im = Image.new("RGBA", (1100, 260), (0, 0, 0, 0))
         ImageDraw.Draw(im).text((20, 30), "हाम्रै खबर", font=f, fill=(215, 0, 10, 255))
+    if im.getchannel("A").getextrema()[0] == 255:      # पारदर्शी छैन भने कुनाको रङ पारदर्शी बनाउने
+        for pt in ((0, 0), (im.width - 1, 0), (0, im.height - 1), (im.width - 1, im.height - 1)):
+            try:
+                ImageDraw.floodfill(im, pt, (0, 0, 0, 0), thresh=40)
+            except Exception:
+                pass
     box = im.getchannel("A").getbbox()
     if box:
         im = im.crop(box)
@@ -879,21 +907,9 @@ def load_logo(h, maxw=None):
     return im.resize((max(1, int(im.width * r)), max(1, int(im.height * r))), Image.LANCZOS)
 
 
-def logo_badge(h, maxw, padx=28, pady=14):
-    """logo कुनै पनि रङको भिडियोमा स्पष्ट देखियोस् भनेर पछाडि हल्का पट्टी (plate) राख्ने।
-    logo गाढा भए सेतो पट्टी, फिक्का भए नीलो पट्टी। पारदर्शी पछाडि नभएको png मा पट्टी राख्दैन।"""
-    lg = load_logo(h, maxw)
-    if lg.getchannel("A").getextrema()[0] == 255:
-        return lg
-    small = lg.resize((24, 24))
-    raw = small.tobytes()
-    pts = [raw[i:i + 4] for i in range(0, len(raw), 4) if raw[i + 3] > 128]
-    lum = sum(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] for p in pts) / len(pts) if pts else 0
-    plate = (11, 31, 92, 225) if lum > 160 else (255, 255, 255, 235)
-    out = Image.new("RGBA", (lg.width + 2 * padx, lg.height + 2 * pady), (0, 0, 0, 0))
-    ImageDraw.Draw(out).rounded_rectangle((0, 0, out.width - 1, out.height - 1), radius=18, fill=plate)
-    out.alpha_composite(lg, (padx, pady))
-    return out
+def logo_badge(h, maxw, padx=0, pady=0):
+    """logo बिना कुनै पछाडिको पट्टी (background)।"""
+    return load_logo(h, maxw)
 
 
 def fallback_bg(path):
@@ -983,6 +999,17 @@ def video_label(credit):
         return credit
     s = credit_site(credit)
     return f"भिडियो साभार: {s}" if s else None
+
+
+def media_label(kind, media, credit):
+    """Pixabay/Pexels का दृश्य 'साङ्केतिक' भनेर चिनाउने; समाचारको भिडियो भए 'भिडियो साभार'।"""
+    lines = [l for l in (credit or "").split("\n") if l.strip()]
+    sym = [l for l in lines if "Pixabay" in l or "Pexels" in l]
+    if sym:
+        if len(sym) >= len(media):
+            return "साङ्केतिक भिडियो" if kind == "video" else "साङ्केतिक तस्बिर"
+        return "केही साङ्केतिक तस्बिर"
+    return video_label(credit) if kind == "video" else None
 
 
 BW, CW = 1400, 240
@@ -1093,40 +1120,89 @@ def layer_x(ox, delay, D, first, last):
     return f"{ox}+({X0})+{SPAN}*{f}"
 
 
-def logo_card_png(path):
-    """पट्टीको बीचमा सवारी गर्ने सेतो कार्ड भित्र logo।"""
-    lg = load_logo(150, 760)
-    card = Image.new("RGBA", (lg.width + 120, lg.height + 70), (0, 0, 0, 0))
-    ImageDraw.Draw(card).rounded_rectangle((0, 0, card.width - 1, card.height - 1), radius=26,
-                                           fill=(255, 255, 255, 255))
-    card.alpha_composite(lg, (60, 35))
-    sh = Image.new("RGBA", (card.width + 60, card.height + 60), (0, 0, 0, 0))
-    sh.paste((0, 0, 0, 150), (30, 38), card.getchannel("A"))
-    sh = sh.filter(ImageFilter.GaussianBlur(14))
-    sh.alpha_composite(card, (30, 30))
-    sh.save(path)
-    return path
+def _vgrad(w, h, c0, c1):
+    g = Image.new("RGBA", (w, h))
+    d = ImageDraw.Draw(g)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        d.line((0, y, w, y), fill=tuple(int(c0[k] + (c1[k] - c0[k]) * t) for k in range(3)) + (255,))
+    return g
 
 
-def thumbnail(path, title, photo):
-    if photo:
-        bg = Image.open(photo).convert("RGB")
-        r = max(W / bg.width, H / bg.height)
-        bg = bg.resize((int(bg.width * r), int(bg.height * r)))
-        bg = bg.crop(((bg.width - W) // 2, (bg.height - H) // 2, (bg.width + W) // 2, (bg.height + H) // 2))
-    else:
-        bg = Image.open(fallback_bg(f"{OUT}/_bg.png")).convert("RGB")
-    bg = Image.alpha_composite(bg.convert("RGBA"), Image.new("RGBA", (W, H), (5, 12, 40, 150)))
-    logo = logo_badge(130, 650, 30, 16)
-    bg.alpha_composite(logo, (50, 40))
-    d = ImageDraw.Draw(bg)
-    f = font(120)
-    lines = wrap(d, title, f, W - 160)[:3]
-    y = H - 100 - 160 * len(lines)
-    for ln in lines:
-        d.text((80, y), ln, font=f, fill="white", stroke_width=6, stroke_fill=(0, 0, 0))
-        y += 160
-    bg.convert("RGB").resize((1280, 720)).save(path, quality=88)
+def thumbnail(path, imgs):
+    """YouTube thumbnail: माथि २-३ फोटोको collage + logo; तल रातो पट्टीमा 'आजका प्रमुख', ठुलो पहेँलो
+    'समाचार', र तल पहेँलो पट्टीमा नेपाली मिति। imgs = समाचारका फोटोको path सूची।"""
+    imgs = [p for p in imgs if p][:3]
+    n, PH, s = len(imgs), 660, 90
+    base = _vgrad(W, H, (10, 28, 120), (4, 10, 50))
+    if n == 0:
+        b = logo_badge(240, 1100)
+        base.alpha_composite(b, ((W - b.width) // 2, 170))
+    seams = [W * k // max(n, 1) for k in range(1, n)]
+    for i, p in enumerate(imgs):
+        a = 0 if i == 0 else seams[i - 1]
+        b = W if i == n - 1 else seams[i]
+        a_top, a_bot = (0, 0) if i == 0 else (a + s // 2, a - s // 2)
+        b_top, b_bot = (W, W) if i == n - 1 else (b + s // 2, b - s // 2)
+        x0, x1 = min(a_top, a_bot), max(b_top, b_bot)
+        w = x1 - x0
+        im = Image.open(p).convert("RGB")
+        r = max(w / im.width, PH / im.height)
+        im = im.resize((int(im.width * r) + 1, int(im.height * r) + 1))
+        cx, cy = (im.width - w) // 2, int((im.height - PH) * 0.3)
+        im = im.crop((cx, cy, cx + w, cy + PH))
+        canvas = Image.new("RGB", (W, H))
+        canvas.paste(im, (x0, 0))
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).polygon([(a_top, 0), (b_top, 0), (b_bot, PH), (a_bot, PH)], fill=255)
+        base.paste(canvas, (0, 0), mask)
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    for x in seams:
+        gd.line((x + s // 2, 0, x - s // 2, PH), fill=(255, 255, 255, 255), width=9)
+    base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(8)))
+    base = Image.alpha_composite(base, glow)
+    # logo पढ्न सजिलो होस् भनेर माथि हल्का छाया (logo आफैंमा background छैन)
+    top = Image.new("RGBA", (W, 230), (0, 0, 0, 0))
+    td = ImageDraw.Draw(top)
+    for y in range(230):
+        td.line((0, y, W, y), fill=(0, 0, 0, int(120 * (1 - y / 230))))
+    base.alpha_composite(top, (0, 0))
+    lg = logo_badge(150, 640)
+    sh = Image.new("RGBA", (lg.width + 60, lg.height + 60), (0, 0, 0, 0))
+    sh.paste((0, 0, 0, 170), (30, 36), lg.getchannel("A"))
+    sh = sh.filter(ImageFilter.GaussianBlur(9))
+    base.alpha_composite(sh, (20, 14))
+    base.alpha_composite(lg, (50, 44))
+
+    line1, line2 = ("आजका प्रमुख", "समाचार") if MODE == "morning" else ("आजको चर्चित", "विषय")
+    # रातो पट्टी
+    bx0, by0, bx1, by1 = 60, 545, W - 60, 715
+    band = _vgrad(bx1 - bx0, by1 - by0, (240, 25, 30), (165, 0, 12))
+    bm = Image.new("L", band.size, 0)
+    ImageDraw.Draw(bm).rounded_rectangle((0, 0, band.width - 1, band.height - 1), radius=22, fill=255)
+    base.paste(band, (bx0, by0), bm)
+    d = ImageDraw.Draw(base)
+    d.rounded_rectangle((bx0, by0, bx1, by1), radius=22, outline=(255, 255, 255, 200), width=4)
+    f1 = font(140)
+    d.text((W // 2 + 4, (by0 + by1) // 2 + 8), line1, font=f1, fill=(0, 0, 0, 150), anchor="mm")
+    d.text((W // 2, (by0 + by1) // 2 + 4), line1, font=f1, fill="white", anchor="mm")
+    # ठुलो पहेँलो शब्द
+    f2 = font(205)
+    d.text((W // 2, 832), line2, font=f2, fill=(255, 235, 20), anchor="mm", stroke_width=12, stroke_fill=(0, 0, 0))
+    # मिति पट्टी
+    px0, py0, px1, py1 = 360, 950, W - 360, 1056
+    pill = _vgrad(px1 - px0, py1 - py0, (255, 240, 60), (250, 195, 15))
+    pm = Image.new("L", pill.size, 0)
+    ImageDraw.Draw(pm).rounded_rectangle((0, 0, pill.width - 1, pill.height - 1), radius=26, fill=255)
+    base.paste(pill, (px0, py0), pm)
+    d = ImageDraw.Draw(base)
+    for k in range(3):                                    # दुवै छेउमा रातो धर्का
+        for left in (True, False):
+            x = (px0 - 200 + k * 48) if left else (px1 + 40 + k * 48)
+            d.polygon([(x + 34, py0), (x + 64, py0), (x + 30, py1), (x, py1)], fill=(215, 0, 10, 255))
+    d.text((W // 2, (py0 + py1) // 2 + 4), bs_date_str(), font=font(80), fill=(10, 10, 10), anchor="mm")
+    base.convert("RGB").resize((1280, 720), Image.LANCZOS).save(path, quality=90)
 
 
 # ---------------------------------------------------------------- आवाज प्रभाव र सङ्गीत
@@ -1229,7 +1305,7 @@ def photo_branch(j, k, mode, nf):
             f"zoompan={zp}:d={nf}:s=1920x1080:fps=25,setsar=1,format=yuv420p[z{j}];")
 
 
-def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, card, first, last, lead,
+def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, first, last, lead,
               simple=False):
     """simple=True: zoom/slide/blur बिनाको सरल पृष्ठभूमि (मुख्य तरिका अड्किए/फेल भए पुनः प्रयासको लागि)।"""
     imgs = list(media or [])
@@ -1276,10 +1352,10 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, 
                        f"duration={SLIDE_FADE}:offset={off:.3f}[{out}];")
                 cur = out
     iA, iF, iB = m, m + 1, m + 2
-    iW0, iNavy, iRed, iWhite, iCard, iWh = m + 3, m + 6, m + 7, m + 8, m + 9, m + 10
+    iW0, iNavy, iRed, iWhite, iWh = m + 3, m + 6, m + 7, m + 8, m + 9
 
     cmd = [FFMPEG, "-y"] + pre + ["-i", audio]
-    for p in [frame, bar] + whites + layers[::-1] + [card]:   # layers: नीलो, रातो, सेतो (तल देखि माथि)
+    for p in [frame, bar] + whites + layers[::-1]:   # layers: नीलो, रातो, सेतो (तल देखि माथि)
         cmd += ["-loop", "1", "-framerate", "25", "-i", p]
     if not last:
         cmd += ["-i", whoosh]
@@ -1287,7 +1363,6 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, 
     s0 = 0.15 if first else (T_HOLD + 0.45)       # शीर्षक पट्टी स्लाइड सुरु हुने समय (transition पछि)
     bx = f"if(lt(t,{s0}),-3000,if(lt(t,{s0 + 0.5}),-w+(260+w)*(t-{s0})/0.5,260))"
     lx = {name: layer_x(ox, dl, dur, first, last) for name, _, ox, dl in LAYERS}
-    card_x = f"{lx['red']}+({RW + SL}-w)/2"
     # transition का तहहरू सुरु र अन्त्यको थोरै बेला मात्र देखिन्छन्; बाँकी समय overlay नगरी CPU बचाउने
     en = f":enable='lt(t,1.0)+gte(t,{max(dur - T_IN - 0.2, 0):.3f})'"
 
@@ -1298,8 +1373,7 @@ def make_clip(idx, kind, media, audio, dur, bar, whites, frame, layers, whoosh, 
            f"[v1][b3]overlay=x='{bx}':y=H-h-45:format=auto[v2];"
            f"[v2][{iNavy}:v]overlay=x='{lx['navy']}':y=0:format=auto{en}[v3];"
            f"[v3][{iRed}:v]overlay=x='{lx['red']}':y=0:format=auto{en}[v4];"
-           f"[v4][{iCard}:v]overlay=x='{card_x}':y=(H-h)/2:format=auto{en}[v5];"
-           f"[v5][{iWhite}:v]overlay=x='{lx['white']}':y=0:format=auto{en}[v];")
+           f"[v4][{iWhite}:v]overlay=x='{lx['white']}':y=0:format=auto{en}[v];")
     lead_ms = int(lead * 1000)
     fc += f"[{iA}:a]" + (f"adelay={lead_ms}|{lead_ms}," if lead_ms else "") + "apad[nar]"
     if last:
@@ -1380,7 +1454,6 @@ def main():
     global ASSETS
     ASSETS = scan_assets()
     layers = sweep_layers(f"{OUT}/sw")
-    card = logo_card_png(f"{OUT}/logo_card.png")
     whoosh = make_whoosh(f"{OUT}/whoosh.wav")
     music, music_gain = make_music(f"{OUT}/music_bed.mp3", pick=(0 if MODE == "morning" else 1))
 
@@ -1388,30 +1461,30 @@ def main():
     voices = make_voices(items)          # सबै भागको आवाज एउटै वाचकमा, बराबर चर्काइमा
 
     print(f"आवाज तयार: {time.time() - t_v:.0f}s")
-    clips, credits, total, thumb_src = [], [], 0.0, None
+    clips, credits, total, thumb_imgs = [], [], 0.0, []
     for i, it in enumerate(items, 1):
         t0 = time.time()
         kind, media, credit = get_media(i, it, news)
         print(f"भाग {i}: मिडिया {kind} ({len(media)}) {time.time() - t0:.0f}s, type={it.get('type')}")
         if credit:
             credits.append(credit)
-        lab = video_label(credit) if kind == "video" else None
+        lab = media_label(kind, media, credit)
         frame = frame_png(f"{OUT}/frame_{i}.png", lab)
-        if thumb_src is None and media:
+        if len(thumb_imgs) < 3 and media and it.get("type") not in ("sensitive", "accident"):
             if kind == "photo":
-                thumb_src = media[0]
+                thumb_imgs.append(media[0])
             else:
                 fp = f"{OUT}/vf_{i}.jpg"
                 try:
                     run([FFMPEG, "-y", "-ss", "1", "-i", media[0], "-frames:v", "1", fp], timeout=60)
-                    thumb_src = fp
+                    thumb_imgs.append(fp)
                 except Exception:
                     pass
         first, last = (i == 1), (i == len(items))
         lead = 0.0 if first else 0.3                         # transition को बीचमा वाचन नसुरु होस्
         dur = duration(voices[i - 1]) + 0.6 + lead
         bar, whites = bar_pngs(f"{OUT}/h_{i}", it["headline"])
-        args = (i, kind, media, voices[i - 1], dur, bar, whites, frame, layers, whoosh, card, first, last, lead)
+        args = (i, kind, media, voices[i - 1], dur, bar, whites, frame, layers, whoosh, first, last, lead)
         try:
             clips.append(make_clip(*args))
         except FFError:
@@ -1425,7 +1498,7 @@ def main():
     concat(clips, final, music, music_gain)
 
     thumb = f"{OUT}/thumb_{MODE}.jpg"
-    thumbnail(thumb, data["title"], thumb_src)
+    thumbnail(thumb, thumb_imgs)
 
     src_lines = []
     for it in items:
@@ -1437,6 +1510,8 @@ def main():
     desc = data["description"] + "\n\nस्रोतहरू:\n" + "\n".join(dict.fromkeys(src_lines))
     if credits:
         desc += "\n\nफोटो/भिडियो:\n" + "\n".join(dict.fromkeys(credits))
+    if any("Pixabay" in c or "Pexels" in c for c in credits):
+        desc += "\n\nनोट: Pixabay/Pexels बाट लिइएका तस्बिर र भिडियो साङ्केतिक (प्रतीकात्मक) हुन्।"
     desc += ("\n\nनोट: यो भिडियोको वाचनमा AI आवाज प्रयोग गरिएको छ। समाचार स्रोतका शीर्षकमा आधारित सारांश हो।\n"
              "हाम्रै खबर - सधै समाचार, सत्य समाचार")
     upload(final, thumb, {"title": data["title"], "description": desc})
