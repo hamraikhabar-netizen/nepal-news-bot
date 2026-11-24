@@ -1,4 +1,3 @@
-
 name: Hamrai Khabar daily
 
 on:
@@ -41,17 +40,19 @@ jobs:
       - name: Install Python packages
         run: pip install -r requirements.txt
 
-      - name: Make video (and upload if YouTube secrets exist)
+      - name: Make video
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          YT_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YT_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          UPLOAD_PRIVACY: ${{ vars.UPLOAD_PRIVACY || 'private' }}
           TTS_ENGINE: ${{ vars.TTS_ENGINE || 'auto' }}
         run: python main.py "$MODE"
+
+      - name: Publish to Facebook
+        env:
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+        run: python publish_reel.py
 
       - name: Save video file
         if: always()
