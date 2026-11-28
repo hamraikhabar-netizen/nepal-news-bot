@@ -16,10 +16,13 @@ concurrency:
   group: hamrai-khabar
   cancel-in-progress: false
 
+permissions:
+  contents: write   # posted.json commit गर्न (समाचार दोहोरिन नदिन)
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     env:
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (github.event.schedule == '15 13 * * *' && 'afternoon' || 'morning') }}
@@ -43,9 +46,8 @@ jobs:
       - name: Make video
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           TTS_ENGINE: ${{ vars.TTS_ENGINE || 'auto' }}
+          FB_PAGE_NAME: ${{ vars.FB_PAGE_NAME || 'I Love Chitwan' }}
         run: python main.py "$MODE"
 
       - name: Publish to Facebook
@@ -53,6 +55,16 @@ jobs:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
         run: python publish_reel.py
+
+      - name: Remember posted news
+        if: success()
+        run: |
+          git config user.name "hamrai-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add posted.json
+          git commit -m "posted news ($MODE)" || exit 0
+          git pull --rebase
+          git push
 
       - name: Save video file
         if: always()
@@ -62,5 +74,6 @@ jobs:
           path: |
             out/final_*.mp4
             out/thumb_*.jpg
+            out/meta.json
           if-no-files-found: ignore
           retention-days: 3
